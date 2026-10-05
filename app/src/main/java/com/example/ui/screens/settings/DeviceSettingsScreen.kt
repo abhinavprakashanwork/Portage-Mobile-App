@@ -69,7 +69,8 @@ fun DeviceSettingsScreen(
   onBackClick: () -> Unit,
   onUpdateDevice: (name: String, type: String) -> Unit,
   onToggleConnection: () -> Unit,
-  onForgetDevice: () -> Unit
+  onForgetDevice: () -> Unit,
+  onDebugTest: (() -> Unit)? = null
 ) {
   var deviceName by remember(deviceProfile.name) { mutableStateOf(deviceProfile.name) }
   var deviceType by remember(deviceProfile.type) { mutableStateOf(deviceProfile.type) }
@@ -295,6 +296,16 @@ fun DeviceSettingsScreen(
           color = PortageDanger,
           fontSize = 15.sp,
           fontWeight = FontWeight.SemiBold
+        )
+      }
+
+      if (onDebugTest != null) {
+        Spacer(modifier = Modifier.height(16.dp))
+        PortageSecondaryButton(
+          text = "Test encrypted channel",
+          onClick = onDebugTest,
+          modifier = Modifier.fillMaxWidth(),
+          height = 54.dp
         )
       }
 

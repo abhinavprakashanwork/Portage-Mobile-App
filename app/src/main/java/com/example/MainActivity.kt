@@ -109,8 +109,13 @@ fun PortageApp(
 
     composable("connect_device") {
       ConnectDeviceScreen(
+        connectionState = viewModel.connectionState.collectAsState().value,
+        onConnect = { viewModel.connect() },
+        onPair = { key -> viewModel.pair(key) },
         onConnected = {
-          navController.navigate("pair_device")
+          navController.navigate("home") {
+            popUpTo("splash") { inclusive = true }
+          }
         }
       )
     }
@@ -266,7 +271,18 @@ fun PortageApp(
               popUpTo(0) { inclusive = true }
             }
           }
-        }
+        },
+        onDebugTest = if (BuildConfig.DEBUG) {
+          { navController.navigate("debug_test") }
+        } else null
+      )
+    }
+
+    composable("debug_test") {
+      DebugTestScreen(
+        connectionState = viewModel.connectionState.collectAsState().value,
+        onBackClick = { navController.popBackStack() },
+        onSendTest = { text -> viewModel.sendTestString(text) }
       )
     }
 

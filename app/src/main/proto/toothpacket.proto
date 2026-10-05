@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package toothpaste;
+
+option java_package = "com.example.toothpaste.protocol";
+option java_multiple_files = true;
+
+message DataPacket {
+  enum PacketID {
+    DATA_PACKET = 0;
+    AUTH_PACKET = 1;
+  }
+
+  PacketID packetID = 1;
+  uint32 packetNumber = 2;
+  uint32 totalPackets = 3;
+  bool slowMode = 4;
+  bytes iv = 5;
+  uint32 dataLen = 6;
+  bytes encryptedData = 7;
+  bytes tag = 8;
+}
+
+message EncryptedData {
+  enum PacketType {
+    KEYBOARD_STRING = 0;
+    KEYBOARD_KEYCODE = 1;
+    MOUSE = 2;
+    RENAME = 3;
+    CONSUMER_CONTROL = 4;
+    COMPOSITE = 5;
+  }
+
+  PacketType packetType = 1;
+  oneof packetData {
+    KeyboardPacket keyboardPacket = 2;
+    KeycodePacket keycodePacket = 3;
+    MousePacket mousePacket = 4;
+    RenamePacket renamePacket = 5;
+    ConsumerControlPacket consumerControlPacket = 6;
+    MouseJigglePacket mouseJigglePacket = 7;
+  }
+}
+
+message ResponsePacket {
+  enum ResponseType {
+    KEEPALIVE = 0;
+    PEER_UNKNOWN = 1;
+    PEER_KNOWN = 2;
+    CHALLENGE = 3;
+  }
+
+  ResponseType responseType = 1;
+  bytes challengeData = 2;
+  string firmwareVersion = 3;
+}
+
+message KeyboardPacket {
+  string message = 1;
+  uint32 length = 2;
+}
+
+message RenamePacket {
+  string message = 1;
+  uint32 length = 2;
+}
+
+message KeycodePacket {
+  bytes code = 1;
+  uint32 length = 2;
+}
+
+message Frame {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+message MousePacket {
+  uint32 num_frames = 1;
+  repeated Frame frames = 2;
+  int32 l_click = 3;
+  int32 r_click = 4;
+  int32 wheel = 5;
+}
+
+message ConsumerControlPacket {
+  repeated uint32 code = 1;
+  uint32 length = 2;
+}
+
+message MouseJigglePacket {
+  bool enable = 1;
+}

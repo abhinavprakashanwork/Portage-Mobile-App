@@ -11,6 +11,7 @@ import com.example.data.model.WorkflowEntity
 import com.example.data.model.WorkflowStepEntity
 import com.example.data.repository.PortageRepository
 import com.example.device.DeviceService
+import com.example.device.DeviceConnectionState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -21,7 +22,9 @@ import kotlinx.coroutines.launch
 class PortageViewModel(application: Application) : AndroidViewModel(application) {
 
   private val repository: PortageRepository
-  private val deviceService = DeviceService()
+  private val deviceService = DeviceService(application)
+
+  val connectionState: StateFlow<DeviceConnectionState> = deviceService.connectionState
 
   val deviceProfile: StateFlow<DeviceProfile?>
   val workflows: StateFlow<List<WorkflowEntity>>
@@ -95,6 +98,28 @@ class PortageViewModel(application: Application) : AndroidViewModel(application)
     viewModelScope.launch {
       repository.finishOnboarding(name, type)
     }
+  }
+
+  fun connect() {
+    viewModelScope.launch {
+      deviceService.connect()
+    }
+  }
+
+  fun pair(keyBase64: String) {
+    viewModelScope.launch {
+      deviceService.pair(keyBase64)
+    }
+  }
+
+  fun sendTestString(text: String) {
+    viewModelScope.launch {
+      deviceService.sendTestString(text)
+    }
+  }
+
+  fun disconnect() {
+    deviceService.disconnect()
   }
 
   fun importExistingProfile(profile: com.example.data.model.ImportableProfile) {

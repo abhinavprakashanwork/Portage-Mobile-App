@@ -33,9 +33,14 @@ import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Cable
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -56,6 +61,7 @@ import com.example.ui.components.HelpLink
 import com.example.ui.components.HelpSheet
 import com.example.ui.components.PortagePrimaryButton
 import com.example.ui.components.PortageTopBar
+import com.example.device.DeviceConnectionState
 import com.example.ui.theme.GeistFontFamily
 import com.example.ui.theme.InstrumentSerifFontFamily
 import com.example.ui.theme.PortageBg
@@ -77,8 +83,12 @@ enum class ConnectionState {
   ERROR
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectDeviceScreen(
+  connectionState: DeviceConnectionState,
+  onConnect: () -> Unit,
+  onPair: (String) -> Unit,
   onConnected: () -> Unit
 ) {
   val context = LocalContext.current
@@ -89,19 +99,17 @@ fun ConnectDeviceScreen(
     mutableStateOf(bluetoothManager?.adapter?.isEnabled == true)
   }
   var showBluetoothDialog by remember { mutableStateOf(false) }
-  var connectionState by remember { mutableStateOf(ConnectionState.IDLE) }
   var showHelpSheet by remember { mutableStateOf(false) }
-  val scope = rememberCoroutineScope()
+  var pairingKey by remember { mutableStateOf("") }
+  val visualState = when (connectionState) {
+    DeviceConnectionState.SCANNING, DeviceConnectionState.CONNECTING, DeviceConnectionState.PAIRING -> ConnectionState.CONNECTING
+    DeviceConnectionState.READY -> ConnectionState.CONNECTED
+    is DeviceConnectionState.ERROR, DeviceConnectionState.UNSUPPORTED -> ConnectionState.ERROR
+    else -> ConnectionState.IDLE
+  }
 
-  fun startConnecting() {
-    if (connectionState != ConnectionState.CONNECTING) {
-      connectionState = ConnectionState.CONNECTING
-      scope.launch {
-        delay(1400)
-        connectionState = ConnectionState.CONNECTED
-        onConnected()
-      }
-    }
+  LaunchedEffect(connectionState) {
+    if (connectionState == DeviceConnectionState.READY) onConnected()
   }
 
   // System enable Bluetooth launcher
@@ -111,38 +119,27 @@ fun ConnectDeviceScreen(
     val enabled = bluetoothManager?.adapter?.isEnabled == true || result.resultCode == Activity.RESULT_OK
     isBluetoothEnabled = enabled
     showBluetoothDialog = false
-    startConnecting()
+    if (enabled) onConnect()
   }
 
-  // Permission launcher for Android 12+ (BLUETOOTH_CONNECT)
   val requestBluetoothPermissionLauncher = rememberLauncherForActivityResult(
-    contract = ActivityResultContracts.RequestPermission()
-  ) { isGranted ->
-    if (isGranted) {
-      val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-      try {
-        enableBluetoothLauncher.launch(enableBtIntent)
-      } catch (e: Exception) {
-        // Fallback for emulator environments
-        isBluetoothEnabled = true
-        showBluetoothDialog = false
-        startConnecting()
-      }
-    } else {
-      // Permission denied fallback (still allows proceeding for browser/emulator environment)
-      isBluetoothEnabled = true
-      showBluetoothDialog = false
-      startConnecting()
+    contract = ActivityResultContracts.RequestMultiplePermissions()
+  ) { permissions ->
+    if (permissions.values.all { it }) {
+      enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
     }
   }
 
   fun triggerEnableBluetooth() {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-      if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT)
-        != PackageManager.PERMISSION_GRANTED) {
-        requestBluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+      val required = arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+      if (required.any { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }) {
+        requestBluetoothPermissionLauncher.launch(required)
         return
       }
+    } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+      requestBluetoothPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+      return
     }
 
     val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
@@ -152,7 +149,7 @@ fun ConnectDeviceScreen(
       // Handles emulators or environments without standard Bluetooth activity
       isBluetoothEnabled = true
       showBluetoothDialog = false
-      startConnecting()
+      onConnect()
     }
   }
 
@@ -161,7 +158,7 @@ fun ConnectDeviceScreen(
     if (!isBluetoothEnabled) {
       showBluetoothDialog = true
     } else {
-      startConnecting()
+      onConnect()
     }
   }
 
@@ -215,7 +212,7 @@ fun ConnectDeviceScreen(
           .testTag("device_panel"),
         contentAlignment = Alignment.Center
       ) {
-        when (connectionState) {
+        when (visualState) {
           ConnectionState.IDLE -> {
             Column(
               horizontalAlignment = Alignment.CenterHorizontally,
@@ -345,9 +342,9 @@ fun ConnectDeviceScreen(
 
       // Connect Button
       PortagePrimaryButton(
-        text = if (connectionState == ConnectionState.CONNECTING) "Connecting…" else "Connect",
+        text = if (visualState == ConnectionState.CONNECTING) "Connecting…" else "Connect",
         onClick = { handleConnectClick() },
-        enabled = connectionState != ConnectionState.CONNECTING,
+        enabled = visualState != ConnectionState.CONNECTING,
         height = 60.dp,
         modifier = Modifier.fillMaxWidth(),
         testTag = "connect_button"
@@ -370,6 +367,35 @@ fun ConnectDeviceScreen(
 
     if (showHelpSheet) {
       HelpSheet(onDismiss = { showHelpSheet = false })
+    }
+
+    if (connectionState == DeviceConnectionState.NEEDS_PAIRING) {
+      ModalBottomSheet(onDismissRequest = {}) {
+        Column(modifier = Modifier.padding(24.dp)) {
+          Text("Pair your ToothPaste", color = PortageText, fontSize = 22.sp, fontFamily = InstrumentSerifFontFamily)
+          Spacer(modifier = Modifier.height(8.dp))
+          Text(
+            "Hold the button on your ToothPaste until it types a key, copy it, paste it here.",
+            color = PortageTextMuted,
+            fontSize = 14.sp,
+            fontFamily = GeistFontFamily
+          )
+          Spacer(modifier = Modifier.height(16.dp))
+          OutlinedTextField(
+            value = pairingKey,
+            onValueChange = { pairingKey = it.filterNot(Char::isWhitespace) },
+            label = { Text("Public key") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+          )
+          Spacer(modifier = Modifier.height(8.dp))
+          TextButton(
+            onClick = { onPair(pairingKey) },
+            enabled = pairingKey.length >= 44,
+            modifier = Modifier.align(Alignment.End)
+          ) { Text("Pair") }
+        }
+      }
     }
   }
 }
