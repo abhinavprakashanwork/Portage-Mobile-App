@@ -1,0 +1,8 @@
+{
+  "name": "Remix Portage V3.1",
+  "description": "Companion app for controlling external devices connected via USB",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
