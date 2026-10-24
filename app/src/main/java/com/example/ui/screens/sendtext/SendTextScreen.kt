@@ -57,6 +57,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.TransmissionEntity
+import com.example.device.DeviceConnectionState
 import com.example.service.PrivacyModeManager
 import com.example.ui.components.BottomSheetGlow
 import com.example.ui.components.PortagePrimaryButton
@@ -81,7 +82,7 @@ import java.util.Locale
 @Composable
 fun SendTextScreen(
   transmissions: List<TransmissionEntity>,
-  isConnected: Boolean,
+  connectionState: DeviceConnectionState,
   onBackClick: () -> Unit,
   onNotificationClick: () -> Unit = {},
   onSendText: suspend (String) -> Boolean,
@@ -94,6 +95,7 @@ fun SendTextScreen(
   val haptics = LocalHapticFeedback.current
   val scope = rememberCoroutineScope()
   val isPrivacyMode by PrivacyModeManager.isPrivacyMode.collectAsState()
+  val isConnected = connectionState == DeviceConnectionState.READY
 
   Box(
     modifier = Modifier
@@ -209,6 +211,23 @@ fun SendTextScreen(
 
       Spacer(modifier = Modifier.height(12.dp))
 
+      if (!isConnected) {
+        Text(
+          text = when (connectionState) {
+            DeviceConnectionState.SCANNING, DeviceConnectionState.CONNECTING, DeviceConnectionState.PAIRING -> "Connecting to device…"
+            DeviceConnectionState.NEEDS_PAIRING -> "Pair your device before sending text."
+            DeviceConnectionState.UNSUPPORTED -> "This device firmware is not supported."
+            is DeviceConnectionState.ERROR -> connectionState.reason
+            DeviceConnectionState.DISCONNECTED -> "Device not connected"
+            DeviceConnectionState.READY -> ""
+          },
+          color = PortageTextMuted,
+          fontSize = 12.sp,
+          fontFamily = GeistFontFamily
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+      }
+
       // Send Button (Height 54)
       PortagePrimaryButton(
         text = if (isSending) "Sending…" else "Send",
@@ -221,11 +240,13 @@ fun SendTextScreen(
           if (textInput.isNotBlank()) {
             isSending = true
             scope.launch {
-              val success = onSendText(textInput)
+              val success = runCatching { onSendText(textInput) }.getOrDefault(false)
               isSending = false
               if (success) {
                 Toast.makeText(context, "Sent to device", Toast.LENGTH_SHORT).show()
                 textInput = ""
+              } else {
+                Toast.makeText(context, "Could not send text. Check the device connection and try again.", Toast.LENGTH_LONG).show()
               }
             }
           }

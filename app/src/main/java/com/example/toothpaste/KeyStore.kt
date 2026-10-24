@@ -44,6 +44,10 @@ class ToothKeyStore(context: Context) {
     preferences.edit().remove(recordKey(deviceId)).apply()
   }
 
+  fun clearAll() {
+    preferences.edit().clear().apply()
+  }
+
   private fun recordKey(deviceId: String): String =
     "device_${deviceId.replace(Regex("[^A-Za-z0-9]"), "_")}"
 

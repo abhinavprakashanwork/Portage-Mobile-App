@@ -48,6 +48,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.DeviceProfile
+import com.example.device.DeviceConnectionState
 import com.example.ui.components.PortagePrimaryButton
 import com.example.ui.components.PortageSecondaryButton
 import com.example.ui.components.PortageTopBar
@@ -66,6 +67,7 @@ import com.example.ui.theme.PortageTextMuted
 @Composable
 fun DeviceSettingsScreen(
   deviceProfile: DeviceProfile,
+  connectionState: DeviceConnectionState,
   onBackClick: () -> Unit,
   onUpdateDevice: (name: String, type: String) -> Unit,
   onToggleConnection: () -> Unit,
@@ -78,6 +80,9 @@ fun DeviceSettingsScreen(
   val context = LocalContext.current
 
   val types = listOf("Laptop", "Desktop", "Tablet", "Other")
+  val isConnecting = connectionState == DeviceConnectionState.SCANNING ||
+    connectionState == DeviceConnectionState.CONNECTING || connectionState == DeviceConnectionState.PAIRING
+  val isReady = connectionState == DeviceConnectionState.READY
 
   Box(
     modifier = Modifier
@@ -125,11 +130,18 @@ fun DeviceSettingsScreen(
             modifier = Modifier
               .size(10.dp)
               .clip(CircleShape)
-              .background(if (deviceProfile.isConnected) PortageSuccess else PortageDanger)
+              .background(if (isReady) PortageSuccess else PortageDanger)
           )
           Spacer(modifier = Modifier.width(10.dp))
           Text(
-            text = if (deviceProfile.isConnected) "Status: Connected" else "Status: Disconnected",
+            text = when (connectionState) {
+              DeviceConnectionState.READY -> "Status: Connected"
+              DeviceConnectionState.SCANNING, DeviceConnectionState.CONNECTING, DeviceConnectionState.PAIRING -> "Status: Connecting"
+              DeviceConnectionState.NEEDS_PAIRING -> "Status: Pairing required"
+              DeviceConnectionState.UNSUPPORTED -> "Status: Unsupported firmware"
+              is DeviceConnectionState.ERROR -> "Status: Connection failed"
+              DeviceConnectionState.DISCONNECTED -> "Status: Disconnected"
+            },
             color = PortageText,
             fontSize = 15.sp,
             fontWeight = FontWeight.Medium
@@ -138,6 +150,7 @@ fun DeviceSettingsScreen(
 
         Button(
           onClick = onToggleConnection,
+          enabled = !isConnecting,
           shape = CircleShape,
           colors = ButtonDefaults.buttonColors(
             containerColor = PortageSurface2,
@@ -153,10 +166,31 @@ fun DeviceSettingsScreen(
           )
           Spacer(modifier = Modifier.width(4.dp))
           Text(
-            text = if (deviceProfile.isConnected) "Disconnect" else "Reconnect",
+            text = when {
+              isConnecting -> "Connecting…"
+              isReady -> "Disconnect"
+              connectionState == DeviceConnectionState.NEEDS_PAIRING -> "Pair device"
+              else -> "Reconnect"
+            },
             fontSize = 12.sp
           )
         }
+      }
+
+      if (connectionState is DeviceConnectionState.ERROR) {
+        Text(
+          text = connectionState.reason,
+          color = PortageDanger,
+          fontSize = 12.sp,
+          modifier = Modifier.padding(top = 8.dp, start = 4.dp)
+        )
+      } else if (connectionState == DeviceConnectionState.UNSUPPORTED) {
+        Text(
+          text = "Update the device firmware to connect.",
+          color = PortageDanger,
+          fontSize = 12.sp,
+          modifier = Modifier.padding(top = 8.dp, start = 4.dp)
+        )
       }
 
       Spacer(modifier = Modifier.height(20.dp))

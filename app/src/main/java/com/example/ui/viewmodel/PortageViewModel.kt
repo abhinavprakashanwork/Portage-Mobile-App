@@ -261,10 +261,7 @@ class PortageViewModel(application: Application) : AndroidViewModel(application)
   }
 
   fun toggleConnection() {
-    viewModelScope.launch {
-      val current = deviceProfile.value?.isConnected ?: true
-      repository.updateConnection(!current)
-    }
+    if (connectionState.value == DeviceConnectionState.READY) disconnect() else connect()
   }
 
   fun sendMouseMove(dx: Float, dy: Float) {
@@ -289,6 +286,7 @@ class PortageViewModel(application: Application) : AndroidViewModel(application)
 
   fun forgetDevice(onForgotten: () -> Unit) {
     viewModelScope.launch {
+      deviceService.forgetDevice()
       repository.clearAllData()
       onForgotten()
     }

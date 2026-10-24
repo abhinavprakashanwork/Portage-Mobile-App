@@ -58,18 +58,6 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
-    if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-      if (event.keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) {
-        com.example.service.VolumeKeyBus.emitKey("Vol +")
-        return true
-      } else if (event.keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) {
-        com.example.service.VolumeKeyBus.emitKey("Vol -")
-        return true
-      }
-    }
-    return super.dispatchKeyEvent(event)
-  }
 }
 
 @Composable
@@ -79,6 +67,7 @@ fun PortageApp(
   val navController = rememberNavController()
 
   val deviceProfile by viewModel.deviceProfile.collectAsState()
+  val connectionState by viewModel.connectionState.collectAsState()
   val workflows by viewModel.workflows.collectAsState()
   val remaps by viewModel.remaps.collectAsState()
   val transmissions by viewModel.transmissions.collectAsState()
@@ -109,12 +98,12 @@ fun PortageApp(
 
     composable("connect_device") {
       ConnectDeviceScreen(
-        connectionState = viewModel.connectionState.collectAsState().value,
+        connectionState = connectionState,
         onConnect = { viewModel.connect() },
         onPair = { key -> viewModel.pair(key) },
         onConnected = {
           navController.navigate("home") {
-            popUpTo("splash") { inclusive = true }
+            popUpTo(0) { inclusive = true }
           }
         }
       )
@@ -159,6 +148,7 @@ fun PortageApp(
     composable("home") {
       HomeScreen(
         deviceProfile = activeProfile,
+        connectionState = connectionState,
         hasUnreadNotifications = hasUnreadNotifications,
         onNavigateToSendText = { navController.navigate("send_text") },
         onNavigateToLiveRelay = { navController.navigate("live_relay") },
@@ -173,7 +163,7 @@ fun PortageApp(
     composable("send_text") {
       SendTextScreen(
         transmissions = transmissions,
-        isConnected = activeProfile.isConnected,
+        connectionState = connectionState,
         onBackClick = { navController.popBackStack() },
         onNotificationClick = { navController.navigate("notifications") },
         onSendText = { text -> viewModel.sendText(text) },
@@ -183,7 +173,7 @@ fun PortageApp(
 
     composable("live_relay") {
       LiveRelayScreen(
-        isConnected = activeProfile.isConnected,
+        connectionState = connectionState,
         onBackClick = { navController.popBackStack() },
         onNotificationClick = { navController.navigate("notifications") },
         onRelayKey = { key -> viewModel.relayKey(key) }
@@ -262,9 +252,15 @@ fun PortageApp(
     composable("device_settings") {
       DeviceSettingsScreen(
         deviceProfile = activeProfile,
+        connectionState = connectionState,
         onBackClick = { navController.popBackStack() },
         onUpdateDevice = { name, type -> viewModel.updateDevice(name, type) },
-        onToggleConnection = { viewModel.toggleConnection() },
+        onToggleConnection = {
+          when (connectionState) {
+            com.example.device.DeviceConnectionState.READY -> viewModel.disconnect()
+            else -> navController.navigate("connect_device")
+          }
+        },
         onForgetDevice = {
           viewModel.forgetDevice {
             navController.navigate("splash") {

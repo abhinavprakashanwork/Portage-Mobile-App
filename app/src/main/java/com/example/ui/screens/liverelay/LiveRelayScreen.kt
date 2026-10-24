@@ -69,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.service.PrivacyModeManager
 import com.example.ui.components.HardwareKeyInterceptor
+import com.example.device.DeviceConnectionState
 import com.example.ui.components.IntelligenceAudioFeedback
 import com.example.ui.components.IntelligenceGlowOverlay
 import com.example.ui.components.PortageTopBar
@@ -98,7 +99,7 @@ data class RelayedKeyItem(
 
 @Composable
 fun LiveRelayScreen(
-  isConnected: Boolean,
+  connectionState: DeviceConnectionState,
   onBackClick: () -> Unit,
   onNotificationClick: () -> Unit = {},
   onRelayKey: suspend (String) -> Boolean
@@ -113,6 +114,7 @@ fun LiveRelayScreen(
   val haptics = LocalHapticFeedback.current
   val scope = rememberCoroutineScope()
   val isPrivacyMode by PrivacyModeManager.isPrivacyMode.collectAsState()
+  val isConnected = connectionState == DeviceConnectionState.READY
   val suggestions = remember {
     listOf("Vol +", "Vol -", "Ctrl + C", "Ctrl + V", "Ctrl + Z", "Ctrl + A", "Alt + Tab", "Win + D", "Esc", "Enter", "Space")
   }
@@ -145,13 +147,19 @@ fun LiveRelayScreen(
   }
 
   // Intercept hardware volume keys with priority
-  HardwareKeyInterceptor()
+  HardwareKeyInterceptor(enabled = isCapturing && isConnected)
 
   // Listen to physical hardware volume keys bus
-  LaunchedEffect(Unit) {
-    com.example.service.VolumeKeyBus.keyEvents.collect { key ->
-      relayAndAddKey(key)
+  LaunchedEffect(isCapturing, connectionState) {
+    if (isCapturing && isConnected) {
+      com.example.service.VolumeKeyBus.keyEvents.collect { key ->
+        relayAndAddKey(key)
+      }
     }
+  }
+
+  LaunchedEffect(connectionState) {
+    if (!isConnected) isCapturing = false
   }
 
   Box(

@@ -326,7 +326,11 @@ fun ConnectDeviceScreen(
               )
               Spacer(modifier = Modifier.height(12.dp))
               Text(
-                text = "No device found",
+                text = when (connectionState) {
+                  DeviceConnectionState.UNSUPPORTED -> "Unsupported firmware"
+                  is DeviceConnectionState.ERROR -> connectionState.reason
+                  else -> "No device found"
+                },
                 color = PortageTextMuted,
                 fontSize = 14.sp
               )

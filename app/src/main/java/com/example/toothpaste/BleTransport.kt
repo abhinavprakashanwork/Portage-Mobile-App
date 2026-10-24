@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
@@ -54,11 +55,13 @@ class BleTransport(private val context: Context) {
   private var packetCharacteristic: BluetoothGattCharacteristic? = null
   private var connectionResult: CompletableDeferred<Int>? = null
   private var operationResult: CompletableDeferred<ByteArray?>? = null
+  var onDisconnected: (() -> Unit)? = null
 
   val responses: Flow<ResponsePacket> = responseEvents.asSharedFlow()
 
   suspend fun connect(): ToothBleConnection = operationMutex.withLock {
     requireBluetoothPermissions()
+    disconnect()
     val device = scanForDevice()
     val connectedGatt = connectGatt(device)
     Log.d(TAG, "Requesting MTU 247")
@@ -99,10 +102,11 @@ class BleTransport(private val context: Context) {
   }
 
   fun disconnect() {
-    gatt?.disconnect()
-    gatt?.close()
+    val connectedGatt = gatt
     gatt = null
     packetCharacteristic = null
+    connectedGatt?.disconnect()
+    connectedGatt?.close()
   }
 
   private suspend fun scanForDevice(): BluetoothDevice = withContext(Dispatchers.Main.immediate) {
@@ -146,11 +150,18 @@ class BleTransport(private val context: Context) {
 
   private fun callback() = object : BluetoothGattCallback() {
     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+      if (this@BleTransport.gatt !== gatt) return
       if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothGatt.STATE_CONNECTED) {
         Log.d(TAG, "GATT connected")
         connectionResult?.complete(status)
       } else {
         connectionResult?.completeExceptionally(Exception("GATT connection failed: status=$status state=$newState"))
+        if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+          this@BleTransport.gatt = null
+          packetCharacteristic = null
+          gatt.close()
+          onDisconnected?.invoke()
+        }
       }
     }
 

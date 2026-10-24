@@ -17,60 +17,65 @@ import com.example.service.VolumeKeyBus
  */
 @Composable
 fun HardwareKeyInterceptor(
+  enabled: Boolean = true,
   onVolumeKey: ((String) -> Unit)? = null
 ) {
   val view = LocalView.current
-  DisposableEffect(view, onVolumeKey) {
-    var parent: ViewParent? = view.parent
-    var dialogWindow: Window? = null
-    while (parent != null) {
-      if (parent is DialogWindowProvider) {
-        dialogWindow = parent.window
-        break
+  DisposableEffect(view, enabled, onVolumeKey) {
+    if (!enabled) {
+      onDispose {}
+    } else {
+      var parent: ViewParent? = view.parent
+      var dialogWindow: Window? = null
+      while (parent != null) {
+        if (parent is DialogWindowProvider) {
+          dialogWindow = parent.window
+          break
+        }
+        parent = parent.parent
       }
-      parent = parent.parent
-    }
 
-    val activity = view.context as? Activity
-    val targetWindow = dialogWindow ?: activity?.window
+      val activity = view.context as? Activity
+      val targetWindow = dialogWindow ?: activity?.window
 
-    if (targetWindow != null) {
-      val originalCallback = targetWindow.callback
-      val customCallback = object : Window.Callback by originalCallback {
-        override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
-          if (event?.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-            when (event.keyCode) {
-              KeyEvent.KEYCODE_VOLUME_UP -> {
-                val key = "Vol +"
-                val accepted = VolumeKeyBus.emitKey(key)
-                if (accepted) {
-                  onVolumeKey?.invoke(key)
+      if (targetWindow != null) {
+        val originalCallback = targetWindow.callback
+        val customCallback = object : Window.Callback by originalCallback {
+          override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
+            if (event?.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+              when (event.keyCode) {
+                KeyEvent.KEYCODE_VOLUME_UP -> {
+                  val key = "Vol +"
+                  val accepted = VolumeKeyBus.emitKey(key)
+                  if (accepted) {
+                    onVolumeKey?.invoke(key)
+                  }
+                  return true
                 }
-                return true
-              }
-              KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                val key = "Vol -"
-                val accepted = VolumeKeyBus.emitKey(key)
-                if (accepted) {
-                  onVolumeKey?.invoke(key)
+                KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                  val key = "Vol -"
+                  val accepted = VolumeKeyBus.emitKey(key)
+                  if (accepted) {
+                    onVolumeKey?.invoke(key)
+                  }
+                  return true
                 }
-                return true
               }
             }
+            return originalCallback.dispatchKeyEvent(event)
           }
-          return originalCallback.dispatchKeyEvent(event)
         }
-      }
 
-      targetWindow.callback = customCallback
+        targetWindow.callback = customCallback
 
-      onDispose {
-        if (targetWindow.callback === customCallback) {
-          targetWindow.callback = originalCallback
+        onDispose {
+          if (targetWindow.callback === customCallback) {
+            targetWindow.callback = originalCallback
+          }
         }
+      } else {
+        onDispose {}
       }
-    } else {
-      onDispose {}
     }
   }
 }

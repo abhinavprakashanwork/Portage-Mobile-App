@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
 import com.example.data.model.DeviceProfile
+import com.example.device.DeviceConnectionState
 import com.example.ui.components.PortageTopBar
 import com.example.ui.theme.GeistFontFamily
 import com.example.ui.theme.HeadingFontFamily
@@ -64,6 +65,7 @@ import com.example.ui.theme.PortageTextMuted
 @Composable
 fun HomeScreen(
   deviceProfile: DeviceProfile,
+  connectionState: DeviceConnectionState,
   hasUnreadNotifications: Boolean = false,
   onNavigateToSendText: () -> Unit,
   onNavigateToLiveRelay: () -> Unit,
@@ -114,11 +116,18 @@ fun HomeScreen(
             modifier = Modifier
               .size(8.dp)
               .clip(CircleShape)
-              .background(if (deviceProfile.isConnected) PortageSuccess else PortageDanger)
+              .background(if (connectionState == DeviceConnectionState.READY) PortageSuccess else PortageDanger)
           )
           Spacer(modifier = Modifier.width(8.dp))
           Text(
-            text = if (deviceProfile.isConnected) "Connected" else "Not connected",
+            text = when (connectionState) {
+              DeviceConnectionState.READY -> "Connected"
+              DeviceConnectionState.SCANNING, DeviceConnectionState.CONNECTING, DeviceConnectionState.PAIRING -> "Connecting"
+              DeviceConnectionState.NEEDS_PAIRING -> "Pairing required"
+              DeviceConnectionState.UNSUPPORTED -> "Unsupported firmware"
+              is DeviceConnectionState.ERROR -> "Connection failed"
+              DeviceConnectionState.DISCONNECTED -> "Not connected"
+            },
             color = PortageText,
             fontSize = 13.sp,
             fontWeight = FontWeight.Medium

@@ -22,6 +22,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 sealed class DeviceEvent {
   data class TextSent(val text: String) : DeviceEvent()
@@ -60,9 +63,19 @@ class DeviceService(context: Context) {
 
   private val transport = BleTransport(context.applicationContext)
   private val keyStore = ToothKeyStore(context.applicationContext)
+  private val connectionMutex = Mutex()
   private var connection: com.example.toothpaste.ToothBleConnection? = null
   private var storedKeys: StoredToothKeys? = null
   private var sessionKey: ByteArray? = null
+
+  init {
+    transport.onDisconnected = {
+      connection = null
+      storedKeys = null
+      sessionKey = null
+      transition(DeviceConnectionState.DISCONNECTED)
+    }
+  }
 
   suspend fun sendText(text: String): Boolean {
     delay(250) // simulate USB HID packet transmission
@@ -70,10 +83,10 @@ class DeviceService(context: Context) {
     return true
   }
 
-  suspend fun connect(): Boolean {
-    return runCatching {
+  suspend fun connect(): Boolean = connectionMutex.withLock {
+    if (_connectionState.value == DeviceConnectionState.READY) return@withLock true
+    try {
       transition(DeviceConnectionState.SCANNING)
-      transition(DeviceConnectionState.CONNECTING)
       val connected = transport.connect()
       connection = connected
       val keys = keyStore.get(connected.deviceId)
@@ -83,8 +96,20 @@ class DeviceService(context: Context) {
       } else {
         authenticate(keys.publicKey)
       }
-      true
-    }.getOrElse { error ->
+      _connectionState.value == DeviceConnectionState.READY ||
+        _connectionState.value == DeviceConnectionState.NEEDS_PAIRING
+    } catch (error: CancellationException) {
+      transport.disconnect()
+      connection = null
+      storedKeys = null
+      sessionKey = null
+      transition(DeviceConnectionState.DISCONNECTED)
+      throw error
+    } catch (error: Exception) {
+      transport.disconnect()
+      connection = null
+      storedKeys = null
+      sessionKey = null
       transition(DeviceConnectionState.ERROR(error.message ?: "Connection failed"))
       false
     }
@@ -149,6 +174,11 @@ class DeviceService(context: Context) {
     storedKeys = null
     sessionKey = null
     transition(DeviceConnectionState.DISCONNECTED)
+  }
+
+  fun forgetDevice() {
+    disconnect()
+    keyStore.clearAll()
   }
 
   suspend fun relayKey(key: String): Boolean {
