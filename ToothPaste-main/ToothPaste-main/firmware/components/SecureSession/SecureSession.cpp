@@ -1,0 +1,729 @@
+#include <Preferences.h>
+#include <nvs_flash.h>
+#include <psa/crypto.h>
+#include <esp_timer.h>
+
+#include "esp_log.h"
+#include "SecureSession.h"
+#include "StateManager.h"
+#include "NeoPixelRMT.h"
+#include "espHID.h"
+
+// USE_SOFTWARE_CRYPTO is injected by CMakeLists.txt based on CONFIG_TOOTHPASTE_SOFTWARE_CRYPTO
+static const char* TAG = "SESSION";
+
+psa_key_id_t private_key_id = 0;  // Stores the ECDH private key ID
+Preferences preferences; // Preferences for storing data
+
+// Class constructor
+SecureSession::SecureSession() : sharedReady(false), aesKeyReady(false)
+{
+    // PSA Crypto initialization handled in init() method
+    private_key_id = 0;
+    mbedtls_gcm_init(&gcm);
+    memset(sharedSecret, 0, ENC_KEYSIZE);
+    memset(aesKey, 0, ENC_KEYSIZE);
+}
+
+// Class destructor
+SecureSession::~SecureSession()
+{
+    // Destroy the PSA key if it exists
+    if (private_key_id != 0) {
+        psa_destroy_key(private_key_id);
+        private_key_id = 0;
+    }
+
+    // Clear secrets from RAM
+    memset(sharedSecret, 0, ENC_KEYSIZE);
+    memset(aesKey, 0, ENC_KEYSIZE);
+    aesKeyReady = false;
+
+    mbedtls_gcm_free(&gcm);
+}
+
+// Initialize PSA Crypto subsystem
+int SecureSession::init()
+{
+    // Initialize PSA Crypto (must be called once before any crypto operations)
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "PSA Crypto init failed: %ld", (long)status);
+        return -1;
+    }
+
+#ifndef USE_SOFTWARE_CRYPTO
+    // Initialize the ATECC608B secure element (identical to ATECC608A)
+    cfg = cfg_ateccx08a_i2c_default;
+    int ret = atcab_init(&cfg);
+    if(ret != 0){
+        ESP_LOGE(TAG, "ATECC608B initialization failed %d", ret);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "ATECC608B initialized successfully");
+
+    // Get info for sanity check
+    uint8_t buf[ATCA_ECC_CONFIG_SIZE];
+    ret = atcab_info(buf);
+    if (ret != 0) {
+        ESP_LOGI(TAG, " failed\n  ! atcab_info returned %02x", ret);
+        return -1;
+    }
+    ESP_LOGI(TAG, " ok: %02x %02x", buf[2], buf[3]);
+#endif
+
+    // Initialize the LRU slot manager (used by both hardware and software paths)
+    slotManager_.load();
+
+#ifdef USE_SOFTWARE_CRYPTO
+    ESP_LOGI(TAG, "Crypto mode: SOFTWARE (mbedtls/PSA)");
+#else
+    ESP_LOGI(TAG, "Crypto mode: HARDWARE (ATECC608B)");
+#endif
+    ESP_LOGI(TAG, "PSA Crypto initialized");
+    return 0;
+}
+
+int SecureSession::generateKeypair(uint8_t outPublicKey[PUBKEY_SIZE], size_t& outPubLen)
+{
+#ifdef USE_SOFTWARE_CRYPTO
+    // Destroy any existing PSA key
+    if (private_key_id != 0) {
+        psa_destroy_key(private_key_id);
+        private_key_id = 0;
+    }
+
+    // Reserve LRU slot now; label is unknown until peer public key arrives
+    uint8_t slot = slotManager_.reserve();
+    if (slot == SlotManager::INVALID_SLOT) {
+        ESP_LOGE(TAG, "No LRU slot available for keypair");
+        return -1;
+    }
+
+    // Generate ECDH keypair via PSA with export flag so private key can be persisted to NVS
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&attributes, 256);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE | PSA_KEY_USAGE_EXPORT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_ECDH);
+    psa_status_t status = psa_generate_key(&attributes, &private_key_id);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "PSA key generation failed: %ld", (long)status);
+        slotManager_.release();
+        private_key_id = 0;
+        return -1;
+    }
+
+    // Export uncompressed public key (65 bytes: 0x04 || X || Y), then compress to 33 bytes
+    uint8_t public_key_uncompressed[65];
+    size_t public_key_len = 0;
+    status = psa_export_public_key(private_key_id, public_key_uncompressed, 65, &public_key_len);
+    if (status != PSA_SUCCESS || public_key_len != 65) {
+        ESP_LOGE(TAG, "PSA public key export failed: %ld", (long)status);
+        slotManager_.release();
+        return -1;
+    }
+
+    outPublicKey[0] = (public_key_uncompressed[64] & 0x01) ? 0x03 : 0x02;
+    memcpy(&outPublicKey[1], &public_key_uncompressed[1], 32);
+    outPubLen = PUBKEY_SIZE;
+
+#else
+    // Reserve an ATECC slot now; label is unknown until peer public key arrives.
+    // If key exchange fails, call slotManager_.release() to free it.
+    uint8_t slot = slotManager_.reserve();
+    if (slot == SlotManager::INVALID_SLOT) {
+        ESP_LOGE(TAG, "No ATECC slot available for keypair");
+        return -1;
+    }
+    ESP_LOGD(TAG, "Reserved ATECC slot %u for keypair generation", slot);
+
+    // Generate the keypair
+    uint8_t public_key_uncompressed[64];
+
+    int ret = atcab_genkey(slot, public_key_uncompressed);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "ATECC key generation failed: %d", ret);
+        slotManager_.release();
+        return -1;
+    }
+    printBase64(public_key_uncompressed, sizeof(public_key_uncompressed));
+
+    // Compress the public key: take prefix byte and X coordinate
+    outPublicKey[0] = (public_key_uncompressed[63] & 0x01) ? 0x03 : 0x02;  // 0x03 if Y is odd, 0x02 if even
+    memcpy(&outPublicKey[1], &public_key_uncompressed[0], 32);  // Copy X coordinate
+    outPubLen = PUBKEY_SIZE;  // 33 bytes
+#endif
+
+    ESP_LOGI(TAG, "Keypair generated");
+    return 0;
+}
+
+// Send the public key over HID and wait for the peer public key
+static void sendPublicKey(void* arg) {
+  SecureSession* session = static_cast<SecureSession*>(arg);
+  ESP_LOGI("SESSION", "Sending public key: %s", session->base64pubKey);
+  sendString(session->base64pubKey); // Send the public key to the client over HID
+  sendString("\n");
+  led.blinkEnd(); // Stop blinking
+
+  // Finish the handshake here
+  led.set(Colors::Purple); // Set green to indicate waiting for peer public key
+  //enablePairingMode(); // Set ble to interpret the next write as a peer public key
+}
+
+// Enter pairing mode, generate a keypair, and send the public key to the transmitter
+void SecureSession::enterPairingMode() {
+  ESP_LOGI(TAG, "Entering pairing mode");
+  stateManager->setState(PAIRING);
+
+  uint8_t pubKey[PUBKEY_SIZE];
+  size_t pubLen;
+
+  int ret = generateKeypair(pubKey, pubLen); // Generate the compressed public key in pairing mode
+
+  // Successful keygen returns 0
+  if (!ret) {
+    // Base64 encode the public key for transmission
+    size_t olen = 0;
+    mbedtls_base64_encode((unsigned char *)base64pubKey, sizeof(base64pubKey), &olen, pubKey, PUBKEY_SIZE);
+    base64pubKey[olen] = '\0';  // Null-terminate the public key string
+
+    // Print Public Key to Serial
+    ESP_LOGI(TAG, "Public key generated: %s", base64pubKey);
+
+    // Create a one-shot timer to send the public key after 5 seconds
+    esp_timer_create_args_t timer_args = {
+      .callback = &sendPublicKey,
+      .arg = this,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "delayedFn"
+    };
+    esp_timer_handle_t oneShotTimer;
+    esp_timer_create(&timer_args, &oneShotTimer);
+    esp_timer_start_once(oneShotTimer, 5000000); // 5 seconds
+  }
+
+  else {
+    char retchar[12];
+    snprintf(retchar, 12, "%d", ret);
+
+    ESP_LOGE(TAG, "Keygen failed with error: %s", retchar);
+    stateManager->setState(ERROR);
+  }
+}
+
+// Compute shared secret given the peer's public key.
+// Stores the peer key mapping to NVS and derives the session AES key.
+int SecureSession::computeSharedSecret(const uint8_t peerPublicKey[PUBKEY_SIZE * 2], size_t peerPubLen, const char* base64pubKey)
+{
+    ESP_LOGD(TAG, "Computing shared secret, peer key len=%u", (unsigned)peerPubLen);
+
+    if (peerPubLen != 65) {
+        ESP_LOGE(TAG, "Peer key must be 65 bytes (uncompressed), got %u", (unsigned)peerPubLen);
+        return -1;
+    }
+
+    // Verify peer public key starts with 0x04 (uncompressed format marker)
+    if (peerPublicKey[0] != 0x04) {
+        ESP_LOGE(TAG, "Invalid peer key format: expected 0x04, got 0x%02x", peerPublicKey[0]);
+        return -1;
+    }
+
+#ifdef USE_SOFTWARE_CRYPTO
+    // Software: compute ECDH via PSA; shared secret written to sharedSecret buffer in RAM
+    size_t output_len = 0;
+    psa_status_t status = psa_raw_key_agreement(PSA_ALG_ECDH, private_key_id,
+                                                 peerPublicKey, peerPubLen,
+                                                 sharedSecret, ENC_KEYSIZE, &output_len);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "ECDH key agreement failed: %ld", (long)status);
+        return -1;
+    }
+    ESP_LOGI(TAG, "Shared secret computed");
+    printBase64(sharedSecret, sizeof(sharedSecret));
+
+#else
+    // ATECC: shared secret goes directly to TempKey, never touches RAM
+    // atcab_ecdh expects raw X||Y (64 bytes); skip the 0x04 uncompressed-point prefix
+    uint8_t trimmedKey[64];
+    memcpy(trimmedKey, peerPublicKey + 1, 64);
+
+    // Generate shared secret — result goes directly to TempKey, never touches RAM
+    uint8_t current_slot = slotManager_.reserve();
+    ESP_LOGD(TAG, "Using private key in ATECC slot %u for ECDH computation", current_slot);
+
+    int ecdh_ret = atcab_ecdh_base(
+        ECDH_MODE_SOURCE_EEPROM_SLOT | ECDH_MODE_COPY_TEMP_KEY,
+        current_slot, trimmedKey, nullptr, nullptr);
+    if (ecdh_ret != 0) {
+        ESP_LOGE(TAG, "ECDH key agreement failed: %d", ecdh_ret);
+        slotManager_.release(); // Free the reserved slot on failure
+        return -1;
+    }
+    ESP_LOGI(TAG, "Shared secret computed");
+#endif
+
+    sharedReady = true;
+
+    // Store PeerPubKey : Slot mapping in NVS for later retrieval
+    int ret = commitPeerKey(base64pubKey);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to save peer key to NVS: %d", ret);
+        return ret;
+    }
+
+    // Derive the session AES key from the shared secret using HKDF
+    ret = deriveAESKeyFromSecret(base64pubKey);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to derive AES key from shared secret: %d", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+// Store peer key mapping to NVS for persistence across reboots.
+// Software mode also persists the raw private key bytes (keyed by peer public key hash).
+int SecureSession::commitPeerKey(std::string base64Input)
+{
+    if (!sharedReady){
+        ESP_LOGD(TAG, "commitPeerKey called but shared secret is not ready");
+        return -1;
+    }
+
+    // Hash the base64-encoded public key to create a fixed-length label for slot management
+    String label = hashKey(base64Input.c_str());
+
+    // Finalize the slot reserved during generateKeypair().
+    // Falls back to assign() if no reservation is pending.
+    char evicted[SlotManager::LABEL_LEN + 1];
+    uint8_t slot = slotManager_.commit(label.c_str(), evicted);
+    if (slot == SlotManager::INVALID_SLOT) {
+        ESP_LOGW(TAG, "No pending reservation; falling back to assign()");
+        bool is_new = false;
+        slot = slotManager_.assign(label.c_str(), &is_new, evicted);
+    }
+
+    if (slot == SlotManager::INVALID_SLOT) {
+        ESP_LOGE(TAG, "SlotManager commit/assign failed");
+        return -1;
+    }
+
+#ifdef USE_SOFTWARE_CRYPTO
+    // Remove evicted peer's private key from NVS before storing the new one
+    if (evicted[0] != '\0') {
+        ESP_LOGW(TAG, "Removing stale private key for evicted label: %s", evicted);
+        preferences.begin("swpkeys", false);
+        preferences.remove(evicted);
+        preferences.end();
+    }
+
+    // Export raw private key scalar (32 bytes) and persist to NVS keyed by peer's public key hash
+    uint8_t privKeyBytes[ENC_KEYSIZE];
+    size_t privKeyLen = 0;
+    psa_status_t status = psa_export_key(private_key_id, privKeyBytes, sizeof(privKeyBytes), &privKeyLen);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to export private key for NVS storage: %ld", (long)status);
+        return -1;
+    }
+    preferences.begin("swpkeys", false);
+    preferences.putBytes(label.c_str(), privKeyBytes, privKeyLen);
+    preferences.end();
+    memset(privKeyBytes, 0, sizeof(privKeyBytes));
+
+#else
+    // ATECC: private key is already stored in ATECC EEPROM; only clean up stale NVS entries
+    if (evicted[0] != '\0') {
+        ESP_LOGW(TAG, "Removing stale secret for evicted label: %s", evicted);
+        preferences.remove(evicted);
+    }
+#endif
+
+    return 0;
+}
+
+// Derive AES key from the session's shared secret
+int SecureSession::deriveAESKeyFromSecret(const char* base64pubKey)
+{
+#ifdef USE_SOFTWARE_CRYPTO
+    // Software: HKDF-SHA256 from sharedSecret held in RAM
+    const uint8_t info[] = "aes-gcm-256"; // Must match peer implementation
+    size_t info_len = sizeof(info) - 1;
+
+    psa_status_t status = psa_generate_random(sessionSalt, sizeof(sessionSalt));
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to generate HKDF salt: %ld", (long)status);
+        return -1;
+    }
+
+    ESP_LOGD(TAG, "Session salt:");
+    printBase64(sessionSalt, sizeof(sessionSalt));
+
+    int ret = hkdf_sha256(
+        sessionSalt, sizeof(sessionSalt),        // random salt for this session
+        sharedSecret, sizeof(sharedSecret),      // session's shared secret
+        info, info_len,                          // context info
+        aesKey, ENC_KEYSIZE                      // output directly to member variable
+    );
+
+    if (ret == 0) {
+        ESP_LOGI(TAG, "AES key derived");
+        aesKeyReady = true;
+    } else {
+        ESP_LOGE(TAG, "AES key derivation failed: %d", ret);
+    }
+    return ret;
+
+#else
+    // ATECC: HKDF via on-chip KDF; shared secret stays in TempKey, never touches RAM
+    static const uint8_t expand_msg[] = "aes-gcm-256\x01"; // info + HKDF counter T(1)
+
+    atcab_random(sessionSalt); // Generate a random salt for this session
+
+    // HKDF Extract: PRK = HMAC-SHA256(salt=AltKeyBuf, IKM=TempKey)
+    // Load sessionSalt into AltKeyBuf (HMAC key = salt); ECDH result stays in TempKey (HMAC data = IKM)
+    int ret = atcab_nonce_load(NONCE_MODE_TARGET_ALTKEYBUF, sessionSalt, ATCA_KEY_SIZE);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "HKDF: failed to load salt into AltKeyBuf: %d", ret);
+        return ret;
+    }
+
+    // source key = AltKeyBuf (salt), message = TempKey (IKM, ECDH result), PRK → TempKey
+    // sessionSalt passed as dummy non-null message ptr; chip reads IKM from TempKey via MSG_LOC_TEMPKEY
+    ret = atcab_kdf(
+        KDF_MODE_ALG_HKDF | KDF_MODE_SOURCE_ALTKEYBUF | KDF_MODE_TARGET_TEMPKEY,
+        0,
+        ((uint32_t)ATCA_KEY_SIZE << 24) | KDF_DETAILS_HKDF_MSG_LOC_TEMPKEY,
+        sessionSalt,
+        nullptr,
+        nullptr);
+
+    if (ret != 0) {
+        ESP_LOGE(TAG, "HKDF Extract failed: %d", ret);
+        return ret;
+    }
+
+    // HKDF Expand: OKM = HMAC-SHA256(PRK=TempKey, info || 0x01)
+    ret = atcab_kdf(
+        KDF_MODE_ALG_HKDF | KDF_MODE_SOURCE_TEMPKEY | KDF_MODE_TARGET_OUTPUT,
+        0, ((uint32_t)(sizeof(expand_msg) - 1) << 24) | KDF_DETAILS_HKDF_MSG_LOC_INPUT,
+        expand_msg,
+        aesKey,
+        nullptr);
+
+    if (ret == 0) {
+        ESP_LOGI(TAG, "AES key derived");
+        aesKeyReady = true;
+    } else {
+        ESP_LOGE(TAG, "HKDF Expand failed: %d", ret);
+    }
+
+    return ret;
+#endif
+}
+
+// Encrypt a given text string using gcm
+int SecureSession::encrypt(
+    const uint8_t* plaintext, // Text data to be encrypted
+    size_t plaintext_len,     // Len of plaintext
+    uint8_t* ciphertext,      // Pointer to store the encrypted data
+    uint8_t iv[IV_SIZE],      // prng initialization vector
+    uint8_t tag[TAG_SIZE],    // Tag for GCM to ensure data integrity
+    const char* base64pubKey)
+
+{
+    // Generate random initialization vector using PSA random generator
+    psa_status_t status = psa_generate_random(iv, IV_SIZE);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to generate random IV: %ld", (long)status);
+        return -1;
+    }
+
+    // Use the session AES key for encryption
+    mbedtls_gcm_init(&gcm);
+    int ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aesKey, ENC_KEYSIZE * 8);
+    if (ret != 0)
+        return ret;
+
+    // Generate ciphertext using GCM to ensure data integrity
+    ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT,
+        plaintext_len,
+        iv, IV_SIZE,
+        nullptr, 0, // no additional data
+        plaintext,
+        ciphertext,
+        TAG_SIZE,
+        tag);
+    mbedtls_gcm_free(&gcm);
+    return ret;
+}
+
+// Decrypt an encrypted string
+int SecureSession::decrypt(
+    const uint8_t iv[IV_SIZE],
+    size_t ciphertext_len,
+    const uint8_t* ciphertext,
+    const uint8_t tag[TAG_SIZE],
+    uint8_t* plaintext_out,
+    const char* base64pubKey)
+{
+    // Use the session AES key for decryption
+    mbedtls_gcm_init(&gcm);
+    int ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aesKey, ENC_KEYSIZE * 8);
+    if (ret != 0)
+        return ret;
+
+    // Decrypt the ciphertext using the AES key
+    ret = mbedtls_gcm_auth_decrypt(&gcm,
+        ciphertext_len,
+        iv, IV_SIZE,
+        nullptr, 0,
+        tag,
+        TAG_SIZE,
+        ciphertext,
+        plaintext_out
+    );
+    mbedtls_gcm_free(&gcm);
+
+    plaintext_out[ciphertext_len] = '\0';
+    return ret;
+}
+
+// Decrypt a toothPaste_DataPacket and return the plaintext bytes in decrypted_out
+int SecureSession::decrypt(toothpaste_DataPacket* packet, uint8_t* decrypted_out, const char* base64pubKey)
+{
+    // Decrypt the packet data
+    int ret = decrypt(
+        packet->iv.bytes,
+        packet->encryptedData.size,
+        packet->encryptedData.bytes,
+        packet->tag.bytes,
+        decrypted_out,
+        base64pubKey
+    );
+    return ret;
+}
+
+// Check if a peer is enrolled and, if so, compute the shared secret on-the-fly using ECDH
+bool SecureSession::loadIfEnrolled(const uint8_t* peerPublicKey, size_t peerPubLen, const char* base64pubKey)
+{
+    String label = hashKey(base64pubKey);
+
+    // Verify enrollment via LRU slot manager (both hardware and software paths)
+    uint8_t slot = slotManager_.lookup(label.c_str());
+    if (slot == SlotManager::INVALID_SLOT){
+        ESP_LOGE(TAG, "Slot not found for label: %s", label.c_str());
+        return false;
+    }
+
+    // Verify peer public key format and length
+    if (peerPubLen != 65) {
+        ESP_LOGE(TAG, "Peer key must be 65 bytes (uncompressed), got %u", (unsigned)peerPubLen);
+        return false;
+    }
+
+    if (peerPublicKey[0] != 0x04) {
+        ESP_LOGE(TAG, "Invalid peer key format: expected 0x04, got 0x%02x", peerPublicKey[0]);
+        return false;
+    }
+
+#ifdef USE_SOFTWARE_CRYPTO
+    // Software: load stored private key from NVS, import into PSA, compute ECDH into RAM
+    preferences.begin("swpkeys", true);
+    bool exists = preferences.isKey(label.c_str());
+    size_t storedLen = exists ? preferences.getBytesLength(label.c_str()) : 0;
+    uint8_t privKeyBytes[ENC_KEYSIZE] = {0};
+    if (exists && storedLen == ENC_KEYSIZE) {
+        preferences.getBytes(label.c_str(), privKeyBytes, ENC_KEYSIZE);
+    }
+    preferences.end();
+
+    if (!exists || storedLen != ENC_KEYSIZE) {
+        ESP_LOGE(TAG, "Private key not found or wrong size for label: %s", label.c_str());
+        return false;
+    }
+
+    // Import private key scalar into PSA for ECDH
+    if (private_key_id != 0) {
+        psa_destroy_key(private_key_id);
+        private_key_id = 0;
+    }
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&attributes, 256);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_ECDH);
+    psa_status_t psa_ret = psa_import_key(&attributes, privKeyBytes, ENC_KEYSIZE, &private_key_id);
+    memset(privKeyBytes, 0, sizeof(privKeyBytes));
+    if (psa_ret != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to import private key: %ld", (long)psa_ret);
+        return false;
+    }
+
+    // Compute shared secret into sharedSecret buffer in RAM
+    size_t output_len = 0;
+    psa_ret = psa_raw_key_agreement(PSA_ALG_ECDH, private_key_id,
+                                     peerPublicKey, peerPubLen,
+                                     sharedSecret, ENC_KEYSIZE, &output_len);
+    if (psa_ret != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "ECDH key agreement failed: %ld", (long)psa_ret);
+        return false;
+    }
+    sharedReady = true;
+    ESP_LOGD(TAG, "Computed shared secret for label=%s", label.c_str());
+
+#else
+    // ATECC: compute shared secret — result goes directly to TempKey, never touches RAM
+    uint8_t trimmedKey[64];
+    memcpy(trimmedKey, peerPublicKey + 1, 64);
+
+    int ecdh_ret = atcab_ecdh_base(
+        ECDH_MODE_SOURCE_EEPROM_SLOT | ECDH_MODE_COPY_TEMP_KEY,
+        slot, trimmedKey, nullptr, nullptr);
+    if (ecdh_ret != 0) {
+        ESP_LOGE(TAG, "ECDH key agreement failed: %d", ecdh_ret);
+        return false;
+    }
+    sharedReady = true;
+    ESP_LOGD(TAG, "Computed shared secret for label=%s slot=%u", label.c_str(), slot);
+#endif
+
+    // Derive AES key from the computed shared secret
+    int ret = deriveAESKeyFromSecret(base64pubKey);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to derive AES key from shared secret: %d", ret);
+        return false;
+    }
+
+    return true;
+}
+
+// Debugging helper to print uint8_t arrays as base64 strings via esp_log
+void SecureSession::printBase64(const uint8_t* data, size_t dataLen)
+{
+    // Calculate the output length: base64 output is ~1.37x input, so (4 * ceil(dataLen / 3))
+    size_t outputLen = 4 * ((dataLen + 2) / 3);
+    unsigned char encoded[outputLen + 1]; // +1 for null-terminator
+    size_t actualLen = 0;
+
+    int ret = mbedtls_base64_encode(
+        encoded,
+        sizeof(encoded),
+        &actualLen,
+        data,
+        dataLen);
+
+    if (ret == 0) {
+        encoded[actualLen] = '\0';
+        ESP_LOGD(TAG, "%s", (const char*)encoded);
+    } else {
+        ESP_LOGE(TAG, "Base64 encoding failed, err %d", ret);
+    }
+}
+
+// Helper: HKDF-Extract and Expand using SHA-256 [TODO: Move to cryptoauthlib]
+int SecureSession::hkdf_sha256(const uint8_t* salt, size_t salt_len,
+    const uint8_t* ikm, size_t ikm_len,
+    const uint8_t* info, size_t info_len,
+    uint8_t* okm, size_t okm_len)
+{
+    int ret = 0;
+    uint8_t pre_key[32]; // SHA-256 output size
+
+    // Initialize the hashing context for mbedtls - use SHA256
+    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!md)
+        return -1;
+
+    // IKM = Input Key Material
+    // HKDF-Extract: pre_key = HMAC(salt, IKM) [IKM is shared secret in case of ECDH]
+    if ((ret = mbedtls_md_hmac(md, salt, salt_len, ikm, ikm_len, pre_key)) != 0)
+        return ret;
+
+    // HKDF-Expand
+    size_t hash_len = 32;
+    size_t n = (okm_len + hash_len - 1) / hash_len;
+
+    uint8_t t[32];
+    size_t t_len = 0;
+
+    uint8_t counter = 1;
+    size_t pos = 0;
+
+    for (size_t i = 0; i < n; i++)
+    {
+        // Create a new context instance for each iteration
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        mbedtls_md_setup(&ctx, md, 1); // HMAC
+
+        mbedtls_md_hmac_starts(&ctx, pre_key, hash_len);
+
+        // Update the temp key (t)
+        if (i != 0)
+            mbedtls_md_hmac_update(&ctx, t, t_len);
+
+        mbedtls_md_hmac_update(&ctx, info, info_len);
+        mbedtls_md_hmac_update(&ctx, &counter, 1);
+        mbedtls_md_hmac_finish(&ctx, t);
+        mbedtls_md_free(&ctx);
+
+        size_t to_copy = (pos + hash_len > okm_len) ? (okm_len - pos) : hash_len;
+        memcpy(okm + pos, t, to_copy);
+        pos += to_copy;
+        t_len = hash_len;
+        counter++;
+    }
+
+    return 0;
+}
+
+// Hash a public key using MD5
+String SecureSession::hashKey(const char* longKey) {
+  const mbedtls_md_info_t* mdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_MD5);
+  if (!mdInfo) return "";
+
+  unsigned char hash[16]; // 128-bit MD5 digest
+  int ret = mbedtls_md(mdInfo, (const unsigned char*)longKey, strlen(longKey), hash);
+  if (ret != 0) return "";
+
+  char hex[33]; // 32 hex chars + null terminator
+  for (int i = 0; i < 16; ++i) {
+    sprintf(hex + i * 2, "%02x", hash[i]);
+  }
+  return String(hex).substring(0, 12); // Use 12-char hash for Preferences key
+}
+
+// Get the device name from storage
+bool SecureSession::getDeviceName(String &deviceNameBuffer){
+    preferences.begin("identity", true);
+    bool ret = preferences.isKey("blename"); // Check if the AES key for the given public key exists
+    // If the name string exists return it
+    if(ret){
+        deviceNameBuffer = preferences.getString("blename");
+    }
+
+    preferences.end();
+    return ret;
+}
+
+// Set the device name
+bool SecureSession::setDeviceName(const char* deviceName){
+    preferences.begin("identity", false);
+
+    bool ret = preferences.isKey("blename"); // Check if the name key exists
+    
+    // If the name string exists remove it before setting the new name to prevent stale data
+    if(ret){
+        preferences.remove("blename");
+    }
+
+    ESP_LOGD(TAG, "Key deletion status: %d", ret);
+    ESP_LOGI(TAG, "Saving device name: %s", deviceName);
+
+    ret = preferences.putString("blename", deviceName);
+    preferences.end();
+    return ret;
+}
