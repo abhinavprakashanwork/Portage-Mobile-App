@@ -779,11 +779,7 @@ private fun TrackpadBox(
               indication = null
             ) {
               haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-              if (isPointerActive) {
-                onMouseClick("LEFT")
-              } else {
-                onActivatePointer()
-              }
+              onMouseClick("LEFT")
             }
             .testTag("trackpad_left_click_button"),
           contentAlignment = Alignment.Center
@@ -812,11 +808,7 @@ private fun TrackpadBox(
               indication = null
             ) {
               haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-              if (isPointerActive) {
-                onMouseClick("RIGHT")
-              } else {
-                onActivatePointer()
-              }
+              onMouseClick("RIGHT")
             }
             .testTag("trackpad_right_click_button"),
           contentAlignment = Alignment.Center

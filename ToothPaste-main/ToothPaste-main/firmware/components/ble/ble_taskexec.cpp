@@ -151,9 +151,9 @@ void packetTask(void* params)
         decryptSendString(&toothPacket, session);
       }
       else if (toothPacket.packetID == toothpaste_DataPacket_PacketID_AUTH_PACKET) {
-        bool pairing = (stateManager->getState() == PAIRING);
+        bool pairing = (stateManager->getState() == PAIRING || stateManager->getState() == UNPAIRED);
         ESP_LOGD(TAG, "AUTH  raw=%uB  mode=%s", pkt.len, pairing ? "PAIRING" : "RECONNECT");
-        if (pairing) {
+        if (pairing || !session->isSharedSecretReady()) {
           generateSharedSecret(&toothPacket, session);
         }
         else {

@@ -8,6 +8,7 @@ BLEServer*         bluServer              = NULL;
 BLECharacteristic* inputCharacteristic    = NULL;
 BLECharacteristic* responseCharacteristic = NULL;
 BLECharacteristic* macCharacteristic      = NULL;
+BLECharacteristic* pubKeyCharacteristic   = NULL;
 
 QueueHandle_t packetQueue  = xQueueCreate(20, sizeof(RawPacket));
 bool          manualDisconnect = false;
@@ -125,6 +126,10 @@ void bleSetup(SecureSession* session)
     MAC_CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ |
     BLECharacteristic::PROPERTY_NOTIFY);
+
+  pubKeyCharacteristic = pService->createCharacteristic(
+    PUBKEY_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ);
 
   uint64_t mac = ESP.getEfuseMac();
   uint8_t initialValue[6];

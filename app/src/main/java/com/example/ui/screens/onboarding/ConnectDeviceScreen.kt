@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -154,6 +155,17 @@ fun ConnectDeviceScreen(
   }
 
   fun handleConnectClick() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      val required = arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+      if (required.any { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }) {
+        requestBluetoothPermissionLauncher.launch(required)
+        return
+      }
+    } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+      requestBluetoothPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+      return
+    }
+
     // If Bluetooth is disabled, prompt the user with the dedicated Bluetooth dialog
     if (!isBluetoothEnabled) {
       showBluetoothDialog = true
@@ -387,7 +399,11 @@ fun ConnectDeviceScreen(
           Spacer(modifier = Modifier.height(16.dp))
           OutlinedTextField(
             value = pairingKey,
-            onValueChange = { pairingKey = it.filterNot(Char::isWhitespace) },
+            onValueChange = {
+              val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+              val filtered = it.filter { char -> alphabet.contains(char) }.take(44)
+              pairingKey = filtered
+            },
             label = { Text("Public key") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
@@ -395,7 +411,7 @@ fun ConnectDeviceScreen(
           Spacer(modifier = Modifier.height(8.dp))
           TextButton(
             onClick = { onPair(pairingKey) },
-            enabled = pairingKey.length >= 44,
+            enabled = pairingKey.length == 44,
             modifier = Modifier.align(Alignment.End)
           ) { Text("Pair") }
         }

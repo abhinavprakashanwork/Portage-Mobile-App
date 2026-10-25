@@ -4,7 +4,10 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class ToothCryptoTest {
   @Test
   fun hkdfMatchesRfc5869TestVectorOne() {
@@ -74,6 +77,21 @@ class ToothCryptoTest {
     val salt = hex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf")
     val expected = hex("7d70f1c988bf3c5aa77e367881853e79dbe61d2c1e92e27549ac6bad61755ab8")
     assertArrayEquals(expected, ToothCrypto.hkdfSha256(secret, salt, "aes-gcm-256".toByteArray()))
+  }
+
+  @Test
+  fun esp32PairingKeyDecompressionTest() {
+    val keyBase64 = "Avn3ddD0nOOOeMBICqFGY8jC565fNgcGMO4L25N3yKvi"
+    val decoded = ToothCrypto.decodeBase64(keyBase64)
+    assertEquals(33, decoded.size)
+    assertEquals(2, decoded[0].toInt())
+    val decompressed = ToothCrypto.decompressPublicKey(decoded)
+    assertEquals(65, decompressed.size)
+    assertEquals(4, decompressed[0].toInt())
+
+    val alice = ToothCrypto.generateKeyPair()
+    val secret = ToothCrypto.deriveSharedSecret(alice.keyPair, decompressed)
+    assertEquals(32, secret.size)
   }
 
   private fun hex(value: String): ByteArray {

@@ -173,6 +173,8 @@ static void sendPublicKey(void* arg) {
   //enablePairingMode(); // Set ble to interpret the next write as a peer public key
 }
 
+extern BLECharacteristic* pubKeyCharacteristic;
+
 // Enter pairing mode, generate a keypair, and send the public key to the transmitter
 void SecureSession::enterPairingMode() {
   ESP_LOGI(TAG, "Entering pairing mode");
@@ -185,6 +187,9 @@ void SecureSession::enterPairingMode() {
 
   // Successful keygen returns 0
   if (!ret) {
+    if (pubKeyCharacteristic != nullptr) {
+      pubKeyCharacteristic->setValue(pubKey, pubLen);
+    }
     // Base64 encode the public key for transmission
     size_t olen = 0;
     mbedtls_base64_encode((unsigned char *)base64pubKey, sizeof(base64pubKey), &olen, pubKey, PUBKEY_SIZE);

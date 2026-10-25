@@ -1,0 +1,42 @@
+import { Typography, Button } from "@material-tailwind/react";
+import { FaGithub } from 'react-icons/fa';
+
+interface SectionProps {
+    currentSlide: number;
+    getSectionOpacity: (index: number) => number;
+}
+
+export default function CTASection({ currentSlide, getSectionOpacity }: SectionProps) {
+    return (
+        <section
+            className="absolute inset-0 flex flex-col items-center justify-center px-6 md:px-12 z-50"
+            style={{
+                opacity: getSectionOpacity(2),
+                transition: 'opacity 0.3s ease-in-out',
+                pointerEvents: getSectionOpacity(2) > 0.5 ? 'auto' : 'none'
+            }}
+        >
+            {/* Title */}
+            <Typography className="font-header text-4xl md:text-5xl xl:text-7xl font-normal text-white mb-8 md:mb-12 text-center">
+                Want to learn more?
+            </Typography>
+
+            {/* Body */}
+            <Typography className="font-body text-xl md:text-2xl xl:text-3xl font-bold text-white text-center max-w-6xl mb-8 md:mb-10">
+                ToothPaste is available on GitHub for anyone to try for themselves.
+            </Typography>
+            <Typography className="font-body text-xl font-light md:text-2xl xl:text-3xl text-white text-center max-w-6xl mb-8 md:mb-10">
+                I'm still slowly rolling it out so issues and feature requests are welcome but might take time to address. If you're interested in collaborating, contributing, or just want to chat about the project feel free to reach out!
+            </Typography>
+
+            {/* Button */}
+            <Button
+                size="lg"
+                className='h-10 bg-primary text-text items-center justify-center px-6' 
+                onClick={() => window.open('https://github.com/Brisk4t/ToothPaste', '_blank')}>
+                <FaGithub className="mr-2 h-5 w-5" />
+                ToothPaste
+            </Button>
+        </section>
+    );
+}

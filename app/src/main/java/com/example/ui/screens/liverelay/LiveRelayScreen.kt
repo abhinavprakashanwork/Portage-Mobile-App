@@ -67,9 +67,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.model.RemapEntity
 import com.example.service.PrivacyModeManager
 import com.example.ui.components.HardwareKeyInterceptor
 import com.example.device.DeviceConnectionState
+import com.example.service.VolumeKeyBus
 import com.example.ui.components.IntelligenceAudioFeedback
 import com.example.ui.components.IntelligenceGlowOverlay
 import com.example.ui.components.PortageTopBar
@@ -99,10 +101,11 @@ data class RelayedKeyItem(
 
 @Composable
 fun LiveRelayScreen(
-  connectionState: DeviceConnectionState,
-  onBackClick: () -> Unit,
-  onNotificationClick: () -> Unit = {},
-  onRelayKey: suspend (String) -> Boolean
+    remaps: List<RemapEntity> = emptyList(),
+    connectionState: DeviceConnectionState,
+    onBackClick: () -> Unit,
+    onNotificationClick: () -> Unit = {},
+    onRelayKey: suspend (String) -> Boolean
 ) {
   var isCapturing by remember { mutableStateOf(false) }
   var manualShortcut by remember { mutableStateOf("") }
@@ -150,10 +153,12 @@ fun LiveRelayScreen(
   HardwareKeyInterceptor(enabled = isCapturing && isConnected)
 
   // Listen to physical hardware volume keys bus
-  LaunchedEffect(isCapturing, connectionState) {
+  LaunchedEffect(isCapturing, connectionState, remaps) {
     if (isCapturing && isConnected) {
-      com.example.service.VolumeKeyBus.keyEvents.collect { key ->
-        relayAndAddKey(key)
+      VolumeKeyBus.keyEvents.collect { key ->
+        val activeRemap = remaps.firstOrNull { it.isActive && it.triggerKey.equals(key, ignoreCase = true) }
+        val finalKey = activeRemap?.targetKey ?: key
+        relayAndAddKey(finalKey)
       }
     }
   }

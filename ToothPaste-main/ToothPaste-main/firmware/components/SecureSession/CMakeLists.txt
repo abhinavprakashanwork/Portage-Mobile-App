@@ -10,10 +10,13 @@ else()
     set(CRYPTO_REQUIRES "esp-cryptoauthlib")
 endif()
 
+file(TO_CMAKE_PATH "$ENV{IDF_PATH}" IDF_PATH_CMAKING)
+
 idf_component_register(
     SRCS ${component_sources}
     INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}"
-    REQUIRES arduino-esp32 nvs_flash toothPacket stateManager espHID rgbRMT ${CRYPTO_REQUIRES}
+                 "${IDF_PATH_CMAKING}/components/mbedtls/mbedtls/tf-psa-crypto/include"
+    REQUIRES arduino-esp32 nvs_flash toothPacket stateManager espHID rgbRMT mbedtls ${CRYPTO_REQUIRES}
 )
 
 if(CONFIG_TOOTHPASTE_SOFTWARE_CRYPTO)

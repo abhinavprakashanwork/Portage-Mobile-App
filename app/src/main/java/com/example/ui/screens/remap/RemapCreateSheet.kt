@@ -264,7 +264,7 @@ fun RemapCreateSheet(
             targetKey = it
             activeRecordingSection = null
           },
-          quickSuggestions = listOf("Space", "Enter", "Ctrl+C", "Esc")
+          quickSuggestions = listOf("Right Arrow", "Enter")
         )
 
         Spacer(modifier = Modifier.height(24.dp))

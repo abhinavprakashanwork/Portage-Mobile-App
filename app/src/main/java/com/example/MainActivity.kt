@@ -173,6 +173,7 @@ fun PortageApp(
 
     composable("live_relay") {
       LiveRelayScreen(
+        remaps = remaps,
         connectionState = connectionState,
         onBackClick = { navController.popBackStack() },
         onNotificationClick = { navController.navigate("notifications") },

@@ -36,8 +36,7 @@ class ToothKeyStore(context: Context) {
   fun put(deviceId: String, keys: StoredToothKeys) {
     require(keys.sharedSecret.size == 32 && keys.publicKey.size == 65)
     val plaintext = byteArrayOf(keys.sharedSecret.size.toByte()) + keys.sharedSecret + keys.publicKey
-    val iv = ToothCrypto.randomBytes(12)
-    preferences.edit().putString(recordKey(deviceId), ToothCrypto.encodeBase64(iv + encrypt(iv, plaintext))).apply()
+    preferences.edit().putString(recordKey(deviceId), ToothCrypto.encodeBase64(encrypt(plaintext))).apply()
   }
 
   fun delete(deviceId: String) {
@@ -68,10 +67,11 @@ class ToothKeyStore(context: Context) {
     return (keyStore.getEntry(keyAlias, null) as KeyStore.SecretKeyEntry).secretKey
   }
 
-  private fun encrypt(iv: ByteArray, plaintext: ByteArray): ByteArray {
+  private fun encrypt(plaintext: ByteArray): ByteArray {
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-    cipher.init(Cipher.ENCRYPT_MODE, secretKey(), GCMParameterSpec(128, iv))
-    return cipher.doFinal(plaintext)
+    cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+    val ciphertext = cipher.doFinal(plaintext)
+    return cipher.iv + ciphertext
   }
 
   private fun decrypt(iv: ByteArray, encrypted: ByteArray): ByteArray {

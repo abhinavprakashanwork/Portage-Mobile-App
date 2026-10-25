@@ -1,5 +1,6 @@
 package com.example.toothpaste
 
+import android.os.Build
 import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.KeyPair
@@ -15,6 +16,7 @@ import javax.crypto.KeyAgreement
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import android.util.Log
 
 data class AesGcmCiphertext(
   val iv: ByteArray,
@@ -52,16 +54,58 @@ object ToothCrypto {
   }
 
   fun decompressPublicKey(compressed: ByteArray): ByteArray {
+    Log.d(
+      "TP_PAIRING",
+      "Decompress input length=${compressed.size} firstByte=${
+        compressed.firstOrNull()?.toUByte()?.toString(16)?.padStart(2, '0') ?: "none"
+      }"
+    )
     require(compressed.size == COMPRESSED_SIZE && (compressed[0].toInt() == 2 || compressed[0].toInt() == 3)) {
       "Expected a 33-byte compressed P-256 public key"
     }
     val x = BigInteger(1, compressed.copyOfRange(1, COMPRESSED_SIZE))
+    Log.d("TP_PAIRING", "Decompress X coordinate length=${P256_SIZE}")
     require(x < P) { "P-256 X coordinate is out of range" }
-    val alpha = x.modPow(THREE, P).subtract(THREE.multiply(x)).add(B).mod(P)
-    var y = alpha.modPow(P.add(BigInteger.ONE).shiftRight(2), P)
-    require(y.multiply(y).mod(P) == alpha) { "Invalid P-256 public key point" }
-    if (y.testBit(0) != (compressed[0].toInt() == 3)) y = P.subtract(y)
-    return encodeUncompressed(x, y)
+
+    val x3 = safeModPow(x, THREE, P)
+    val threeX = THREE.multiply(x)
+    val rawAlpha = x3.subtract(threeX).add(B)
+    val alpha = rawAlpha.mod(P)
+
+    val exponent = P.add(BigInteger.ONE).shiftRight(2)
+    val y = safeModPow(alpha, exponent, P)
+    val ySquaredModP = y.multiply(y).mod(P)
+
+    Log.d(
+      "TP_PAIRING",
+      "API=${Build.VERSION.SDK_INT} " +
+        "ySqEqAlpha=${ySquaredModP == alpha}"
+    )
+
+    var calculatedY = y
+    require(ySquaredModP == alpha) { "Invalid P-256 public key point" }
+    if (calculatedY.testBit(0) != (compressed[0].toInt() == 3)) calculatedY = P.subtract(calculatedY)
+    return encodeUncompressed(x, calculatedY).also {
+      Log.d(
+        "TP_PAIRING",
+        "Decompress output length=${it.size} firstByte=${
+          it.firstOrNull()?.toUByte()?.toString(16)?.padStart(2, '0') ?: "none"
+        }"
+      )
+    }
+  }
+
+  private fun safeModPow(base: BigInteger, exponent: BigInteger, m: BigInteger): BigInteger {
+    var result = BigInteger.ONE
+    val baseMod = base.mod(m)
+    val bitLength = exponent.bitLength()
+    for (i in bitLength - 1 downTo 0) {
+      result = result.multiply(result).mod(m)
+      if (exponent.testBit(i)) {
+        result = result.multiply(baseMod).mod(m)
+      }
+    }
+    return result
   }
 
   fun deriveSharedSecret(keyPair: KeyPair, peerUncompressed: ByteArray): ByteArray {
@@ -72,6 +116,12 @@ object ToothCrypto {
     val point = java.security.spec.ECPoint(
       BigInteger(1, peerUncompressed.copyOfRange(1, 33)),
       BigInteger(1, peerUncompressed.copyOfRange(33, 65))
+    )
+    Log.d(
+      "TP_PAIRING",
+      "EC point input length=${peerUncompressed.size} firstByte=${
+        peerUncompressed.firstOrNull()?.toUByte()?.toString(16)?.padStart(2, '0') ?: "none"
+      } xLength=${P256_SIZE} yLength=${P256_SIZE}"
     )
     val peerSpec = ECPublicKeySpec(point, ownPublic.params as ECParameterSpec)
     val peerKey = KeyFactory.getInstance("EC").generatePublic(peerSpec)
@@ -162,6 +212,10 @@ private object Base64Codec {
 
   fun decode(value: String): ByteArray {
     val normalized = value.trim()
+    Log.d(
+      "TP_PAIRING",
+      "Base64 input length=${value.length} normalizedLength=${normalized.length} containsWhitespace=${value.any(Char::isWhitespace)}"
+    )
     require(normalized.isNotEmpty() && normalized.length % 4 == 0) { "Invalid base64 length" }
     val result = ArrayList<Byte>(normalized.length * 3 / 4)
     var index = 0

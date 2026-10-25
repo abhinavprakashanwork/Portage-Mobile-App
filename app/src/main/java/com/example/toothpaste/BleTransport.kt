@@ -35,8 +35,33 @@ data class ToothBleConnection(
   val deviceId: String,
   val deviceName: String?,
   val gatt: BluetoothGatt,
-  val packetCharacteristic: BluetoothGattCharacteristic
-)
+  val packetCharacteristic: BluetoothGattCharacteristic,
+  val pubKeyBytes: ByteArray?
+) {
+  override fun equals(other: Any?): Boolean {
+    if (this === other) return true
+    if (javaClass != other?.javaClass) return false
+    other as ToothBleConnection
+    if (deviceId != other.deviceId) return false
+    if (deviceName != other.deviceName) return false
+    if (gatt != other.gatt) return false
+    if (packetCharacteristic != other.packetCharacteristic) return false
+    if (pubKeyBytes != null) {
+      if (other.pubKeyBytes == null) return false
+      if (!pubKeyBytes.contentEquals(other.pubKeyBytes)) return false
+    } else if (other.pubKeyBytes != null) return false
+    return true
+  }
+
+  override fun hashCode(): Int {
+    var result = deviceId.hashCode()
+    result = 31 * result + (deviceName?.hashCode() ?: 0)
+    result = 31 * result + gatt.hashCode()
+    result = 31 * result + packetCharacteristic.hashCode()
+    result = 31 * result + (pubKeyBytes?.contentHashCode() ?: 0)
+    return result
+  }
+}
 
 class BleTransport(private val context: Context) {
   companion object {
@@ -44,6 +69,7 @@ class BleTransport(private val context: Context) {
     const val PACKET_UUID = "6856e119-2c7b-455a-bf42-cf7ddd2c5907"
     const val RESPONSE_UUID = "6856e119-2c7b-455a-bf42-cf7ddd2c5908"
     const val MAC_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214"
+    const val PUBKEY_UUID = "19b10003-e8f2-537e-4f6c-d104768a1214"
     const val FIRMWARE_MINIMUM = "0.9.0"
     private const val TAG = "TP"
     private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -75,6 +101,7 @@ class BleTransport(private val context: Context) {
       ?: error("ToothPaste response characteristic not found")
     val mac = service.getCharacteristic(UUID.fromString(MAC_UUID))
       ?: error("ToothPaste MAC characteristic not found")
+    val pubKeyChar = service.getCharacteristic(UUID.fromString(PUBKEY_UUID))
 
     check(connectedGatt.setCharacteristicNotification(response, true)) {
       "Could not enable response notifications"
@@ -84,11 +111,12 @@ class BleTransport(private val context: Context) {
     awaitOperation { connectedGatt.writeDescriptor(cccd) }
     val macBytes = awaitOperation { connectedGatt.readCharacteristic(mac) }
       ?: error("MAC characteristic returned no data")
+    val pubKeyBytes = pubKeyChar?.let { try { awaitOperation { connectedGatt.readCharacteristic(it) } } catch (_: Exception) { null } }
     val deviceId = macBytes.joinToString("") { "%02x".format(it) }
-    Log.d(TAG, "Connected deviceId=$deviceId")
+    Log.d(TAG, "Connected deviceId=$deviceId pubKeyBytes=${pubKeyBytes?.size}")
     gatt = connectedGatt
     packetCharacteristic = packet
-    ToothBleConnection(deviceId, device.name, connectedGatt, packet)
+    ToothBleConnection(deviceId, device.name, connectedGatt, packet, pubKeyBytes)
   }
 
   suspend fun writeWithoutResponse(bytes: ByteArray) = operationMutex.withLock {
@@ -219,8 +247,16 @@ class BleTransport(private val context: Context) {
 
   private fun requireBluetoothPermissions() {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-      check(ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED)
-      check(ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED)
+      check(ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
+        "Bluetooth scan permission is required. Please grant Bluetooth permissions."
+      }
+      check(ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+        "Bluetooth connect permission is required. Please grant Bluetooth permissions."
+      }
+    } else {
+      check(ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+        "Location permission is required for Bluetooth scanning."
+      }
     }
   }
 }

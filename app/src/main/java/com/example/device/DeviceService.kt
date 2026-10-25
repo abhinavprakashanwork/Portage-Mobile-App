@@ -9,6 +9,7 @@ import com.example.toothpaste.ToothKeyStore
 import com.example.toothpaste.protocol.DataPacket
 import com.example.toothpaste.protocol.EncryptedData
 import com.example.toothpaste.protocol.KeyboardPacket
+import com.example.toothpaste.protocol.KeycodePacket
 import com.example.toothpaste.protocol.ResponsePacket
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.delay
@@ -78,9 +79,37 @@ class DeviceService(context: Context) {
   }
 
   suspend fun sendText(text: String): Boolean {
-    delay(250) // simulate USB HID packet transmission
-    _events.emit(DeviceEvent.TextSent(text))
-    return true
+    return runCatching {
+      check(connectionState.value == DeviceConnectionState.READY) { "ToothPaste is not ready" }
+      val key = sessionKey ?: error("No active ToothPaste session")
+      val keyboard = KeyboardPacket.newBuilder()
+        .setMessage(text)
+        .setLength(text.length)
+        .build()
+      val encryptedData = EncryptedData.newBuilder()
+        .setPacketType(EncryptedData.PacketType.KEYBOARD_STRING)
+        .setKeyboardPacket(keyboard)
+        .build()
+      val encrypted = ToothCrypto.aesGcmEncrypt(key, encryptedData.toByteArray())
+      val packet = DataPacket.newBuilder()
+        .setPacketID(DataPacket.PacketID.DATA_PACKET)
+        .setPacketNumber(1)
+        .setTotalPackets(1)
+        .setSlowMode(true)
+        .setIv(ByteString.copyFrom(encrypted.iv))
+        .setDataLen(encrypted.ciphertext.size)
+        .setEncryptedData(ByteString.copyFrom(encrypted.ciphertext))
+        .setTag(ByteString.copyFrom(encrypted.tag))
+        .build()
+      val bytes = packet.toByteArray()
+      Log.d(TAG, "Send text packet bytes=${bytes.size} payload=${encrypted.ciphertext.size}")
+      transport.writeWithoutResponse(bytes)
+      _events.emit(DeviceEvent.TextSent(text))
+      true
+    }.getOrElse { error ->
+      Log.e(TAG, "Send text failed", error)
+      false
+    }
   }
 
   suspend fun connect(): Boolean = connectionMutex.withLock {
@@ -117,19 +146,36 @@ class DeviceService(context: Context) {
 
   suspend fun pair(keyBase64: String): Boolean {
     return runCatching {
+      Log.d(TAG, "PAIR_STAGE 1: Base64 decode input length=${keyBase64.length}")
       val compressed = ToothCrypto.decodeBase64(keyBase64.trim())
+      Log.d(TAG, "PAIR_STAGE 2: 33-byte validation (decoded size=${compressed.size})")
       require(compressed.size == 33) { "Pairing key must decode to 33 bytes" }
+
+      Log.d(TAG, "PAIR_STAGE 3: Public-key decompression")
       val peerPublicKey = ToothCrypto.decompressPublicKey(compressed)
+
+      Log.d(TAG, "PAIR_STAGE 4: Android keypair generation")
       val generated = ToothCrypto.generateKeyPair()
+
+      Log.d(TAG, "PAIR_STAGE 5: ECDH shared secret derivation")
       val secret = ToothCrypto.deriveSharedSecret(generated.keyPair, peerPublicKey)
+
       val connected = connection ?: error("Connect to a ToothPaste first")
+
+      Log.d(TAG, "PAIR_STAGE 6: Key storage for deviceId=${connected.deviceId}")
       keyStore.put(connected.deviceId, StoredToothKeys(secret, generated.publicKey))
       storedKeys = StoredToothKeys(secret, generated.publicKey)
+
       transition(DeviceConnectionState.PAIRING)
       delay(AUTH_DELAY_MS)
+
+      Log.d(TAG, "PAIR_STAGE 7: Sending Android public key (AUTH_PACKET)")
       authenticate(generated.publicKey)
+
+      Log.d(TAG, "PAIR_STAGE 8: Pairing completed successfully")
       true
     }.getOrElse { error ->
+      Log.e(TAG, "PAIR_FAILED at stage: exception=${error::class.java.name} message=${error.message}", error)
       transition(DeviceConnectionState.ERROR(error.message ?: "Pairing failed"))
       false
     }
@@ -184,22 +230,144 @@ class DeviceService(context: Context) {
   suspend fun relayKey(key: String): Boolean {
     delay(50) // ultra low latency relay
     _events.emit(DeviceEvent.KeyRelayed(key))
-    return true
+    return sendShortcut(key)
   }
 
   suspend fun sendMouseMove(dx: Float, dy: Float): Boolean {
-    _events.emit(DeviceEvent.MouseMove(dx, dy))
-    return true
+    return runCatching {
+      if (connectionState.value != DeviceConnectionState.READY) return@runCatching false
+      val key = sessionKey ?: return@runCatching false
+      val frame = com.example.toothpaste.protocol.Frame.newBuilder()
+        .setX(dx.toInt())
+        .setY(dy.toInt())
+        .build()
+      val mousePacket = com.example.toothpaste.protocol.MousePacket.newBuilder()
+        .setNumFrames(1)
+        .addFrames(frame)
+        .setLClick(0)
+        .setRClick(0)
+        .setWheel(0)
+        .build()
+      val encryptedData = EncryptedData.newBuilder()
+        .setPacketType(EncryptedData.PacketType.MOUSE)
+        .setMousePacket(mousePacket)
+        .build()
+      val encrypted = ToothCrypto.aesGcmEncrypt(key, encryptedData.toByteArray())
+      val packet = DataPacket.newBuilder()
+        .setPacketID(DataPacket.PacketID.DATA_PACKET)
+        .setPacketNumber(1)
+        .setTotalPackets(1)
+        .setSlowMode(true)
+        .setIv(ByteString.copyFrom(encrypted.iv))
+        .setDataLen(encrypted.ciphertext.size)
+        .setEncryptedData(ByteString.copyFrom(encrypted.ciphertext))
+        .setTag(ByteString.copyFrom(encrypted.tag))
+        .build()
+      transport.writeWithoutResponse(packet.toByteArray())
+      _events.emit(DeviceEvent.MouseMove(dx, dy))
+      true
+    }.getOrElse { error ->
+      Log.e(TAG, "Send mouse move failed", error)
+      false
+    }
   }
 
   suspend fun sendMouseClick(button: String = "LEFT"): Boolean {
-    _events.emit(DeviceEvent.MouseClick(button))
-    return true
+    return runCatching {
+      if (connectionState.value != DeviceConnectionState.READY) return@runCatching false
+      val key = sessionKey ?: return@runCatching false
+      val lClick = if (button == "LEFT") 1 else 0
+      val rClick = if (button == "RIGHT") 1 else 0
+      val mousePacket = com.example.toothpaste.protocol.MousePacket.newBuilder()
+        .setNumFrames(1)
+        .setLClick(lClick)
+        .setRClick(rClick)
+        .setWheel(0)
+        .build()
+      val encryptedData = EncryptedData.newBuilder()
+        .setPacketType(EncryptedData.PacketType.MOUSE)
+        .setMousePacket(mousePacket)
+        .build()
+      val encrypted = ToothCrypto.aesGcmEncrypt(key, encryptedData.toByteArray())
+      val packet = DataPacket.newBuilder()
+        .setPacketID(DataPacket.PacketID.DATA_PACKET)
+        .setPacketNumber(1)
+        .setTotalPackets(1)
+        .setSlowMode(true)
+        .setIv(ByteString.copyFrom(encrypted.iv))
+        .setDataLen(encrypted.ciphertext.size)
+        .setEncryptedData(ByteString.copyFrom(encrypted.ciphertext))
+        .setTag(ByteString.copyFrom(encrypted.tag))
+        .build()
+      transport.writeWithoutResponse(packet.toByteArray())
+      _events.emit(DeviceEvent.MouseClick(button))
+      true
+    }.getOrElse { error ->
+      Log.e(TAG, "Send mouse click failed", error)
+      false
+    }
   }
 
   suspend fun sendShortcut(shortcut: String): Boolean {
-    _events.emit(DeviceEvent.ShortcutSent(shortcut))
-    return true
+    return runCatching {
+      if (connectionState.value != DeviceConnectionState.READY) return@runCatching false
+      val key = sessionKey ?: error("No active ToothPaste session")
+      
+      val trimmed = shortcut.trim()
+      Log.d(TAG, "Android destination: $trimmed")
+
+      val hidConstant = when (trimmed.lowercase()) {
+        "right arrow", "right" -> 0xD7.toByte() // KEY_RIGHT_ARROW in IDFHIDKeyboard.h (0xD7 - 0x88 = 0x4F)
+        "enter" -> 0xB0.toByte() // KEY_RETURN in IDFHIDKeyboard.h (0xB0 - 0x88 = 0x28)
+        else -> null
+      }
+
+      val encryptedData = if (hidConstant != null) {
+        Log.d(TAG, "SPECIAL_KEY mapped to HID constant=0x${String.format("%02X", hidConstant)}")
+        val codeBytes = byteArrayOf(hidConstant, 0, 0, 0, 0, 0)
+        val keycodePacket = KeycodePacket.newBuilder()
+          .setCode(ByteString.copyFrom(codeBytes))
+          .setLength(1)
+          .build()
+        EncryptedData.newBuilder()
+          .setPacketType(EncryptedData.PacketType.KEYBOARD_KEYCODE)
+          .setKeycodePacket(keycodePacket)
+          .build()
+      } else {
+        Log.d(TAG, "TEXT destination sent as string")
+        val keyboard = KeyboardPacket.newBuilder()
+          .setMessage(shortcut)
+          .setLength(shortcut.length)
+          .build()
+        EncryptedData.newBuilder()
+          .setPacketType(EncryptedData.PacketType.KEYBOARD_STRING)
+          .setKeyboardPacket(keyboard)
+          .build()
+      }
+
+      val encrypted = ToothCrypto.aesGcmEncrypt(key, encryptedData.toByteArray())
+      Log.d(TAG, "BLE payload iv=${encrypted.iv.size}B cipher=${encrypted.ciphertext.size}B")
+
+      val packet = DataPacket.newBuilder()
+        .setPacketID(DataPacket.PacketID.DATA_PACKET)
+        .setPacketNumber(1)
+        .setTotalPackets(1)
+        .setSlowMode(true)
+        .setIv(ByteString.copyFrom(encrypted.iv))
+        .setDataLen(encrypted.ciphertext.size)
+        .setEncryptedData(ByteString.copyFrom(encrypted.ciphertext))
+        .setTag(ByteString.copyFrom(encrypted.tag))
+        .build()
+
+      val bytes = packet.toByteArray()
+      Log.d(TAG, "HID report bytes sent total=${bytes.size}B")
+      transport.writeWithoutResponse(bytes)
+      _events.emit(DeviceEvent.ShortcutSent(shortcut))
+      true
+    }.getOrElse { error ->
+      Log.e(TAG, "Send shortcut failed", error)
+      false
+    }
   }
 
   suspend fun runWorkflow(

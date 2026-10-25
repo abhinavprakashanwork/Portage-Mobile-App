@@ -1,0 +1,454 @@
+import { createContext, useRef, useMemo } from "react";
+import type { ReactNode, RefObject } from "react";
+import { saveBase64, loadBase64 } from "../services/localSecurity/EncryptedStorage";
+import { ec as EC } from "elliptic";
+import { create, toBinary } from "@bufbuild/protobuf";
+
+import * as ToothPacketPB from '../services/packetService/toothpacket/toothpacket_pb.js';
+import type { DataPacket, DataPacket_PacketID, EncryptedData } from '../services/packetService/toothpacket/toothpacket_pb.js';
+
+const ec = new EC("p256"); // Define the elliptic curve (secp256r1)
+
+export interface ECDHContextValue {
+    keyPair: RefObject<CryptoKeyPair | null>;
+    generateECDHKeyPair: () => Promise<CryptoKeyPair>;
+    saveSelfKeys: (clientID: string, sharedSecret: ArrayBuffer) => Promise<void>;
+    compressKey: (pkey: CryptoKey) => Promise<Uint8Array>;
+    decompressKey: (compressedBytes: Uint8Array) => ArrayBufferLike;
+    importPeerPublicKey: (rawKeyBuffer: BufferSource) => Promise<CryptoKey>;
+    deriveSharedSecret: (peerPubKey: CryptoKey) => Promise<ArrayBuffer>;
+    deriveAESKey: (sharedSecret: BufferSource, salt?: Uint8Array<ArrayBuffer>) => Promise<void>;
+    savePeerPublicKey: (peerPublicKey: ArrayBuffer, clientID: string) => Promise<void>;
+    encryptText: (unEncryptedData: string | Uint8Array<ArrayBuffer>, aad?: ArrayBuffer | null) => Promise<DataPacket>;
+    decryptText: (ciphertextBase64: string) => Promise<string>;
+    createEncryptedPackets: (
+        packetId: DataPacket_PacketID,
+        payload: EncryptedData,
+        slowMode?: boolean,
+        packetPrefix?: number
+    ) => AsyncGenerator<DataPacket>;
+    loadKeys: (clientID: string, salt?: Uint8Array<ArrayBuffer>) => Promise<void>;
+    processPeerKeyAndGenerateSharedSecret: (peerKeyBase64: string, deviceMacAddress: string) => Promise<string>;
+}
+
+// Shared context for ECDH operations
+export const ECDHContext = createContext<ECDHContextValue | null>(null);
+
+export const ECDHProvider = ({ children }: { children: ReactNode }) => {
+    const aesKey = useRef<CryptoKey | null>(null); // AESKey cryptoKey for encrypting/decrypting messages
+    const keyPair = useRef<CryptoKeyPair | null>(null);
+
+    /**
+     * Generate a new ECDH key pair using P-256 curve
+     * Stores the pair in keyPair.current for later use in key derivation
+     */
+    const generateECDHKeyPair = async (): Promise<CryptoKeyPair> => {
+        const pair = await crypto.subtle.generateKey(
+            {
+                name: "ECDH",
+                namedCurve: "P-256",
+            },
+            false, // Extractable (only applies to private key)
+            ["deriveKey", "deriveBits"]
+        );
+        keyPair.current = pair; // Store the key pair in state
+        return pair;
+    };
+
+    /**
+     * Save self public key and shared secret to IndexedDB storage
+     * @throws {Error} If key pair is not yet generated
+     */
+    const saveKeys = async (clientID: string, sharedSecret: ArrayBuffer): Promise<void> => {
+        if (!keyPair.current) {
+            return;
+        }
+
+        if (!sharedSecret) {
+            return;
+        }
+
+        // Export the public key as an arraybuffer (65 bytes uncompressed)
+        var rawPublicKey = await crypto.subtle.exportKey("raw", keyPair.current.publicKey);
+
+        // Convert the arraybuffer to base64 for storage
+        var b64SelfPubkey = arrayBufferToBase64(rawPublicKey);
+
+        // Store the shared secret in base64 format
+        var b64SharedSecret = arrayBufferToBase64(sharedSecret);
+
+        // Store the public key and shared secret in IndexedDB under the clientID
+        await saveBase64(clientID, "SelfPublicKey", b64SelfPubkey);
+        await saveBase64(clientID, "sharedSecret", b64SharedSecret);
+
+        return;
+    };
+
+    /**
+     * Compress a P-256 public key from uncompressed (65 bytes) to compressed (33 bytes) format
+     * Uses point compression with prefix 0x02 (even Y) or 0x03 (odd Y)
+     * @throws {Error} If key format is not valid uncompressed P-256 format
+     */
+    const compressKey = async (pkey: CryptoKey): Promise<Uint8Array> => {
+        try {
+            const rawKey = new Uint8Array(await crypto.subtle.exportKey("raw", pkey));
+            console.log("[ECDHContext] Compressing key, raw length:", rawKey.length);
+
+            if (rawKey[0] !== 0x04 || rawKey.length !== 65) {
+                throw new Error(`Unexpected raw public key format: first byte ${rawKey[0].toString(16)}, length ${rawKey.length}`);
+            }
+            const x = rawKey.slice(1, 33);
+            const y = rawKey.slice(33, 65);
+
+            if (x.length !== 32 || y.length !== 32) {
+                throw new Error(`Invalid key component lengths: x=${x.length}, y=${y.length}`);
+            }
+
+            const prefix = y[y.length - 1] % 2 === 0 ? 0x02 : 0x03;
+            const compressed = new Uint8Array(33);
+            compressed[0] = prefix;
+            compressed.set(x, 1);
+
+            console.log("[ECDHContext] Compressed key successfully");
+            return compressed;
+        } catch (error) {
+            console.error("[ECDHContext] Error compressing key:", error);
+            throw error;
+        }
+    };
+
+    /**
+     * Decompress a compressed P-256 public key (33 bytes) to uncompressed format (65 bytes)
+     * Uses elliptic curve math to recover the full Y coordinate from the compressed format
+     * @returns Uncompressed key in raw format (65 bytes): [0x04, ...x, ...y]
+     */
+    const decompressKey = (compressedBytes: Uint8Array): ArrayBuffer => {
+        try {
+            console.log("[ECDHContext] Decompressing key, input length:", compressedBytes.length);
+            const key = ec.keyFromPublic(compressedBytes, "array");
+            const pubPoint = key.getPublic();
+            const x = pubPoint.getX().toArray("be", 32);
+            const y = pubPoint.getY().toArray("be", 32);
+
+            console.log("[ECDHContext] Decompressed x length:", x.length, "y length:", y.length);
+
+            if (x.length !== 32) throw new Error(`X coordinate should be 32 bytes, got ${x.length}`);
+            if (y.length !== 32) throw new Error(`Y coordinate should be 32 bytes, got ${y.length}`);
+
+            const uncompressed = new Uint8Array(65);
+            uncompressed[0] = 0x04;
+            uncompressed.set(x, 1);
+            uncompressed.set(y, 33);
+
+            console.log("[ECDHContext] Decompressed key successfully, output length:", uncompressed.length);
+            return uncompressed.buffer;
+        } catch (error) {
+            console.error("[ECDHContext] Error decompressing key:", error);
+            throw error;
+        }
+    };
+
+    /**
+     * Import a peer's uncompressed public key as a CryptoKey object for ECDH operations
+     */
+    const importPeerPublicKey = async (rawKeyBuffer: BufferSource): Promise<CryptoKey> => {
+        return await crypto.subtle.importKey("raw",
+            rawKeyBuffer,
+            { name: "ECDH", namedCurve: "P-256" },
+            true, // Extractable
+            []);
+    };
+
+    /**
+     * Import a private key in PKCS8 format as a CryptoKey for ECDH operations
+     * (currently unused, kept for future key-import flows)
+     */
+    const importSelfPrivateKey = async (rawKeyBuffer: BufferSource): Promise<CryptoKey> => {
+        return await crypto.subtle.importKey(
+            "pkcs8", // Private key format
+            rawKeyBuffer,
+            { name: "ECDH", namedCurve: "P-256" },
+            false, // extractable
+            ["deriveKey", "deriveBits"] // Key usages for ECDH
+        );
+    };
+
+    /**
+     * Import raw AES-GCM key bytes as a CryptoKey for encryption/decryption
+     * (currently unused, kept for future key-import flows)
+     */
+    async function importAESKeyFromBytes(keyBytes: BufferSource, extractable = false, usages: KeyUsage[] = ["encrypt", "decrypt"]): Promise<CryptoKey> {
+        return await crypto.subtle.importKey(
+            "raw",
+            keyBytes,
+            { name: "AES-GCM" },
+            extractable,
+            usages
+        );
+    }
+
+    /**
+     * Save peer's public key to IndexedDB storage in base64 format
+     * @throws {Error} If peerPublicKey is null or invalid
+     */
+    const savePeerPublicKey = async (peerPublicKey: ArrayBuffer, clientID: string): Promise<void> => {
+        if (!peerPublicKey) {
+            throw new Error("Invalid peer public key");
+        }
+
+        const PeerPublicKeyBase64 = arrayBufferToBase64(peerPublicKey);
+        await saveBase64(clientID, "PeerPublicKey", PeerPublicKeyBase64);
+    };
+
+    /**
+     * Derive the shared secret using ECDH with peer's public key
+     * @returns The shared secret (256 bits)
+     */
+    const deriveSharedSecret = async (peerPubKey: CryptoKey): Promise<ArrayBuffer> => {
+        return await crypto.subtle.deriveBits(
+            {
+                name: "ECDH",
+                public: peerPubKey,
+            },
+            keyPair.current!.privateKey,
+            256
+        );
+    };
+
+    /**
+     * Derive AES-GCM encryption key from a shared secret using HKDF
+     * Stores result in aesKey.current
+     */
+    const deriveAESKey = async (sharedSecret: BufferSource, salt: Uint8Array<ArrayBuffer> = new Uint8Array([])): Promise<void> => {
+        const info = new TextEncoder().encode("aes-gcm-256");
+        const keyMaterial = await crypto.subtle.importKey(
+            "raw",
+            sharedSecret,
+            "HKDF",
+            false,
+            ["deriveKey"]
+        );
+
+        const aesKeyGen = await crypto.subtle.deriveKey(
+            {
+                name: "HKDF",
+                hash: "SHA-256",
+                salt,
+                info,
+            },
+            keyMaterial,
+            {
+                name: "AES-GCM",
+                length: 256,
+            },
+            true, // not extractable
+            ["encrypt", "decrypt"]
+        );
+
+
+        // Log the base64 AES key for debugging
+        const exportedAESKey = await crypto.subtle.exportKey("raw", aesKeyGen);
+        const base64AESKey = arrayBufferToBase64(exportedAESKey);
+        console.log("[ECDHContext] Derived AES key (base64):", base64AESKey);
+
+        aesKey.current = aesKeyGen;
+
+
+    };
+
+    /**
+     * Encrypt data using AES-GCM with the derived shared secret key
+     * Generates random 12-byte IV and returns authentication tag separately
+     * @param aad - Additional authenticated data (unused but available for integrity checking)
+     * @returns DataPacket with encryptedData, IV, tag, and metadata
+     */
+    const encryptText = async (unEncryptedData: string | Uint8Array<ArrayBuffer>, aad?: ArrayBuffer | null): Promise<DataPacket> => {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const data = unEncryptedData instanceof Uint8Array ? unEncryptedData : new TextEncoder().encode(unEncryptedData);
+
+        const encryptedBytes = new Uint8Array(await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv },
+            aesKey.current!,
+            data
+        ));
+
+        const ciphertextLength = encryptedBytes.length - 16; // 16-byte auth tag
+
+        return create(ToothPacketPB.DataPacketSchema, {
+            encryptedData: encryptedBytes.slice(0, ciphertextLength),
+            dataLen: ciphertextLength,
+            iv,
+            tag: encryptedBytes.slice(ciphertextLength),
+        });
+    };
+
+    /**
+     * Decrypt ciphertext using AES-GCM with the derived shared secret key
+     * Expected format: base64 string with 12-byte IV prepended to ciphertext+tag
+     * @returns Decrypted plaintext as UTF-8 string
+     */
+    const decryptText = async (ciphertextBase64: string): Promise<string> => {
+        try {
+            const ciphertextArray = new Uint8Array(base64ToArrayBuffer(ciphertextBase64));
+            console.log("[ECDHContext] Decrypting, ciphertext length:", ciphertextArray.length);
+
+            if (ciphertextArray.length < 12) {
+                throw new Error(`Ciphertext too short: need at least 12 bytes for IV, got ${ciphertextArray.length}`);
+            }
+
+            const iv = ciphertextArray.slice(0, 12);
+            const data = ciphertextArray.slice(12);
+            console.log("[ECDHContext] IV length:", iv.length, "data length:", data.length);
+
+            const decrypted = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv },
+                aesKey.current!,
+                data
+            );
+
+            console.log("[ECDHContext] Decrypted successfully");
+            return new TextDecoder().decode(decrypted);
+        } catch (error) {
+            console.error("[ECDHContext] Decryption error:", error);
+            throw error;
+        }
+    };
+
+    /**
+     * Create and encrypt a ToothPacket payload, yielding encrypted DataPackets
+     * Generator function that can yield multiple packets if payload exceeds max size
+     */
+    const createEncryptedPackets = async function* (
+        packetId: DataPacket_PacketID,
+        payload: EncryptedData,
+        slowMode = true,
+        packetPrefix = 0
+    ): AsyncGenerator<DataPacket> {
+
+        // Convert the protobuf payload to a byte array for encryption
+        const toothPacketBinary = toBinary(ToothPacketPB.EncryptedDataSchema, payload);
+
+        // Encrypt the encryptedData component of a ToothPacket and get DataPacket
+        const encryptedPacket = await encryptText(toothPacketBinary, null);
+
+        // Set packet metadata
+        encryptedPacket.packetID = packetId;
+        encryptedPacket.slowMode = slowMode;
+
+        // Not used for now
+        encryptedPacket.packetNumber = 1;
+        encryptedPacket.totalPackets = 1;
+
+        yield encryptedPacket;
+    };
+
+    /**
+     * Load previously saved keys from IndexedDB storage for a device
+     * Restores shared secret and derives AES key using HKDF with provided salt
+     * Updates internal aesKey.current state
+     */
+    const loadKeys = async (clientID: string, salt: Uint8Array<ArrayBuffer> = new Uint8Array([])): Promise<void> => {
+        var sharedSecretB64 = await loadBase64(clientID, "sharedSecret");
+        var sharedSecretBuffer = base64ToArrayBuffer(sharedSecretB64 as string);
+
+        // Derive the AES key from the stored shared secret using the provided salt
+        await deriveAESKey(sharedSecretBuffer, salt);
+    };
+
+    /**
+     * Complete key exchange flow: decompress peer key, generate our key pair, derive AES key, and save all keys
+     * Single high-level function that encapsulates the entire ECDH handshake process
+     * @param peerKeyBase64 - Peer's compressed public key in base64 format (decodes to 33 bytes)
+     * @returns Base64-encoded uncompressed self public key to send to peer
+     * @throws {Error} If peer key is not 33 bytes, or if any cryptographic operation fails
+     */
+    const processPeerKeyAndGenerateSharedSecret = async (peerKeyBase64: string, deviceMacAddress: string): Promise<string> => {
+        try {
+            console.log("[ECDHContext] Starting key exchange for device:", deviceMacAddress);
+
+            // Decompress and import peer public key
+            const compressedBytes = new Uint8Array(base64ToArrayBuffer(peerKeyBase64));
+            console.log("[ECDHContext] Peer key decoded, length:", compressedBytes.length);
+
+            if (compressedBytes.length !== 33) {
+                throw new Error(`Compressed public key must be 33 bytes, got ${compressedBytes.length}`);
+            }
+
+            // Decompress the peer's compressed public key to raw uncompressed format
+            // Then import it as a CryptoKey object for ECDH operations
+            const rawUncompressed = decompressKey(compressedBytes);
+            console.log("[ECDHContext] Decompressed peer key");
+
+            const peerPublicKeyObject = await importPeerPublicKey(rawUncompressed);
+            console.log("[ECDHContext] Imported peer public key as CryptoKey");
+
+            // Save the peer public key
+            const rawPeerPublicKey = await crypto.subtle.exportKey('raw', peerPublicKeyObject);
+            await savePeerPublicKey(rawPeerPublicKey, deviceMacAddress);
+            console.log("[ECDHContext] Saved peer public key");
+
+            // Generate our key pair
+            await generateECDHKeyPair();
+            console.log("[ECDHContext] Generated self key pair");
+
+            // Export our public key in raw uncompressed format and convert to base64 for sending to peer
+            const rawSelfPublicKey = await crypto.subtle.exportKey('raw', keyPair.current!.publicKey);
+            const b64SelfPublic = arrayBufferToBase64(rawSelfPublicKey);
+            console.log("[ECDHContext] Exported self public key, base64 length:", b64SelfPublic.length);
+
+            // Derive shared secret using peer's public key
+            const sharedSecret = await deriveSharedSecret(peerPublicKeyObject);
+            console.log("[ECDHContext] Derived shared secret");
+
+            // Save all keys (self public key and shared secret)
+            await saveKeys(deviceMacAddress, sharedSecret);
+            console.log("[ECDHContext] Saved all keys");
+
+            return b64SelfPublic;
+        } catch (error) {
+            console.error("[ECDHContext] Key exchange failed:", error);
+            throw error;
+        }
+    };
+
+    // Context Provider return
+    const contextValue: ECDHContextValue = useMemo(() => ({
+        keyPair,
+        generateECDHKeyPair,
+        saveSelfKeys: saveKeys,
+        compressKey,
+        decompressKey,
+        importPeerPublicKey,
+        deriveSharedSecret,
+        deriveAESKey,
+        savePeerPublicKey,
+        encryptText,
+        decryptText,
+        createEncryptedPackets,
+        loadKeys,
+        processPeerKeyAndGenerateSharedSecret,
+    }), []);
+
+    return (
+        <ECDHContext.Provider value={contextValue}>
+            {children}
+        </ECDHContext.Provider>
+    );
+};
+
+// Convert byte array to Base64 string
+export function arrayBufferToBase64(buffer: ArrayBufferLike): string {
+    const rawBytes = new Uint8Array(buffer);
+    const binaryString = Array.from(rawBytes, (b) => String.fromCharCode(b)).join("");
+    return btoa(binaryString);
+}
+
+// Convert Base64 string to byte array
+export function base64ToArrayBuffer(base64: string): ArrayBuffer {
+    const decoded = atob(base64);
+    const bytes = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; i++) {
+        bytes[i] = decoded.charCodeAt(i);
+    }
+    return bytes.buffer;
+}

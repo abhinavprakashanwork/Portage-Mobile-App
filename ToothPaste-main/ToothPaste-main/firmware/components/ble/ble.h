@@ -16,6 +16,7 @@
 #define TX_TO_TOOTHPASTE_CHARACTERISTIC "6856e119-2c7b-455a-bf42-cf7ddd2c5907"
 #define RESPONSE_CHARACTERISTIC     "6856e119-2c7b-455a-bf42-cf7ddd2c5908"
 #define MAC_CHARACTERISTIC_UUID     "19b10002-e8f2-537e-4f6c-d104768a1214"
+#define PUBKEY_CHARACTERISTIC_UUID  "19b10003-e8f2-537e-4f6c-d104768a1214"
 
 // Max serialized DataPacket: IV(14) + encryptedData(231) + authTag(22) + scalars(~11) ≈ 278 bytes
 #define BLE_MAX_RAW_PACKET 320
@@ -27,6 +28,7 @@ struct RawPacket {
 
 // Shared globals — defined in ble.cpp, used across ble_auth.cpp and ble_dispatch.cpp
 extern BLECharacteristic* responseCharacteristic;
+extern BLECharacteristic* pubKeyCharacteristic;
 extern QueueHandle_t      packetQueue;
 extern char               clientPubKey[70];
 extern size_t             clientPubKeyLen;
